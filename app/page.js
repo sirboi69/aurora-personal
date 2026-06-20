@@ -3,7 +3,8 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { LineChart, Line, ResponsiveContainer, YAxis, Tooltip } from "recharts";
 import { Scan, History, Briefcase, BookOpen, RefreshCw, Settings2, Clock } from "lucide-react";
-import { detectDisplacements, markTestedLevels, suggestTradeFromBox, DEFAULT_PARAMS } from "./lib/granBoxLogic";
+import { DEFAULT_PARAMS } from "./lib/granBoxLogic";
+import { buildUnifiedSignals, STRATEGY_META } from "./lib/unifiedSignals";
 import { runBacktest, PIP_SIZE_BY_SYMBOL } from "./lib/backtestEngine";
 import { getCurrentWindowStatus, fmtHourRo } from "./lib/timeWindows";
 
@@ -106,9 +107,48 @@ function ParamsPanel({ params, setParams }) {
   );
 }
 
-function BoxCard({ box, params, accent, highlighted, candles, instrumentLabel, decimals, windowStatus }) {
-  const trade = suggestTradeFromBox(box, params);
-  const dirColor = box.direction === "bullish" ? "#4ADE80" : "#F87171";
+function describeSignalForPrompt(signal) {
+  const r = signal.raw;
+  switch (signal.strategy) {
+    case "granbox":
+      return `Strategia "Gran Box": pe un candle de displacement (impuls puternic) se marchează o zonă folosind doar body-ul candle-ului. Se trasează niveluri Fibonacci 0/0.25/0.5/0.75/1 peste zonă. Prețul a revenit la nivelul țintă pentru o posibilă intrare.
+Zonă body: ${r.zoneLow} - ${r.zoneHigh}
+Sweep/penetrare în candle-ul anterior: ${(r.penetration * 100).toFixed(0)}%
+Box testat deja: ${r.tested ? "da" : "nu"}`;
+    case "fvg":
+      return `Strategia "Fair Value Gap" (ICT): un gap de imbalance pe 3 candle-uri consecutive, unde candle 1 nu se suprapune cu candle 3. Prețul tinde să revină și să reacționeze la umplerea gap-ului.
+Zonă gap: ${r.zoneLow} - ${r.zoneHigh}
+Gap umplut deja: ${r.filled ? "da" : "nu"}`;
+    case "orderblock":
+      return `Strategia "Order Block" (ICT clasic, checklist 7 puncte): ultimul candle opus culorii înainte de un impuls puternic care a spart structura.
+Zonă body: ${r.zoneLow} - ${r.zoneHigh}
+Reguli valide: ${r.passCount}/7
+Checklist detaliat: ${JSON.stringify(r.checklist)}`;
+    case "rejectionblock":
+      return `Strategia "Rejection Block": pe timeframe mare (4h), un candle cu body foarte mic (open≈close) și fitile mari arată o respingere puternică. Nivelul (open≈close) e proiectat în timp ca linie de reacție viitoare.
+Nivel: ${r.level}
+Body/range ratio: ${(r.bodyRatio * 100).toFixed(0)}%
+Candle high/low: ${r.candleHigh} / ${r.candleLow}
+Reacționat deja: ${r.reacted ? "da" : "nu"}`;
+    case "power3":
+      return `Strategia "Power 3" (ICT): Accumulation (range Asia) → Manipulation (fals breakout, de obicei London) → Distribution/Expansion (mișcarea reală, de obicei NY).
+Asia range: ${r.asiaLow} - ${r.asiaHigh}
+Manipulare detectată: ${r.manipulation ? `da, pe partea ${r.manipulation.side}, direcție așteptată ${r.manipulation.direction}` : "nu încă"}
+Stadiu curent: ${r.stage}
+Expansion: ${r.expansion ? `${r.expansion.active ? "activă" : "în așteptare"}, mișcare până acum ${r.expansion.moveSoFar?.toFixed(2)}` : "n/a"}`;
+    case "orderflow":
+      return `Strategia "Order Flow basic": structură de piață (swing highs/lows clasificate HH/HL bullish sau LH/LL bearish) combinată cu momentum din candle-uri consecutive.
+Bias structură: ${r.structureBias}
+Candle-uri consecutive în aceeași direcție: ${r.consecutiveCount}
+Accelerare momentum: ${r.accelerating ? "da" : "nu"}`;
+    default:
+      return "";
+  }
+}
+
+function SignalCard({ signal, params, decimals, candles, instrumentLabel, windowStatus }) {
+  const meta = STRATEGY_META[signal.strategy];
+  const dirColor = signal.direction === "bullish" ? "#4ADE80" : "#F87171";
   const [analysis, setAnalysis] = useState(null);
   const [loading, setLoading] = useState(false);
   const [analysisError, setAnalysisError] = useState(null);
@@ -119,10 +159,9 @@ function BoxCard({ box, params, accent, highlighted, candles, instrumentLabel, d
     setAnalysisError(null);
     setAnalysis(null);
     try {
-      // Give Claude the 40 candles surrounding the box (before + after) so it can see
-      // real swing highs/lows, wicks, and structure — not just the box in isolation.
-      const contextStart = Math.max(0, box.index - 25);
-      const contextEnd = Math.min(candles.length, box.index + 15);
+      const boxIndex = signal.raw.index ?? candles.length - 1;
+      const contextStart = Math.max(0, boxIndex - 25);
+      const contextEnd = Math.min(candles.length, boxIndex + 15);
       const contextCandles = candles.slice(contextStart, contextEnd);
       const candlesText = contextCandles
         .map((c, i) => `${i}: ${c.time} O:${c.open} H:${c.high} L:${c.low} C:${c.close}`)
@@ -132,24 +171,18 @@ function BoxCard({ box, params, accent, highlighted, candles, instrumentLabel, d
         ? windowStatus.windows.filter((w) => w.isActive).map((w) => w.note).join(", ") || "în afara ferestrelor principale"
         : "necunoscut";
 
-      const prompt = `Ești un trader experimentat care analizează un setup "Gran Box" pe ${instrumentLabel}.
+      const prompt = `Ești un trader experimentat care analizează un setup pe ${instrumentLabel}.
 
-Strategia: pe un candle de displacement (impuls puternic) se marchează o zonă ("gran box") folosind doar body-ul candle-ului (open-close). Se trasează niveluri Fibonacci 0/0.25/0.5/0.75/1 peste acea zonă. Prețul a revenit/revine la nivelul țintă (${params.targetLevel}) pentru o posibilă intrare.
+${describeSignalForPrompt(signal)}
 
-Date despre acest box:
-- Direcție: ${box.direction === "bullish" ? "bullish (impuls în sus)" : "bearish (impuls în jos)"}
-- Box format la: ${box.time}
-- Zonă body: ${box.zoneLow} - ${box.zoneHigh}
-- Nivel țintă (entry candidat): ${box.levels[params.targetLevel]}
-- Sweep/penetrare în candle-ul anterior: ${(box.penetration * 100).toFixed(0)}%
-- Box testat deja: ${box.tested ? "da" : "nu"}
-
+Direcție semnal: ${signal.direction === "bullish" ? "bullish (în sus)" : "bearish (în jos)"}
+Format/detectat la: ${signal.time}
 Fereastra orară activă acum: ${activeWindowsText}
 
-Candle-uri din jur (index, ora, open, high, low, close), pentru context de structură/swing-uri:
+Candle-uri din jur (index, ora, open, high, low, close), pentru context de structură/swing-uri/lichiditate:
 ${candlesText}
 
-Analizează acest setup ca un trader uman: nu folosi o formulă fixă de SL/TP. Uită-te la swing high/low-urile reale din candle-urile de mai sus, la fitile, la structura din jurul box-ului, și decide unde ar sta logic un Stop Loss (unde setup-ul ar fi clar invalidat) și un Take Profit (următoarea zonă reală de lichiditate/structură), ținând cont de orice altceva relevant (impuls, context, fereastra orară).
+Analizează acest setup ca un trader uman, ținând cont mai presus de toate de lichiditate (unde sunt stop-loss-urile altora, unde s-ar lua lichiditate înainte de mișcarea reală). Nu folosi o formulă fixă de SL/TP. Uită-te la swing high/low-urile reale, la fitile, la structura din jur, și decide unde ar sta logic un Stop Loss (unde setup-ul ar fi clar invalidat) și un Take Profit (următoarea zonă reală de lichiditate/structură).
 
 Scrie 4-6 propoziții explicând raționamentul ca un trader, apoi încheie STRICT cu acest bloc, completat cu valorile tale (fără alte adăugiri după el):
 
@@ -179,43 +212,30 @@ VERDICT: [INTRU ACUM / AȘTEPT / EVIT]`;
   };
 
   return (
-    <div style={{
-      background: highlighted ? "rgba(74,222,128,0.06)" : "#101218",
-      border: `1px solid ${highlighted ? "rgba(74,222,128,0.35)" : "#1E2128"}`,
-      borderRadius: 8, padding: 14, marginBottom: 10,
-    }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+    <div style={{ background: "#101218", border: "1px solid #1E2128", borderLeft: `2px solid ${meta?.color || "#2A2D35"}`, borderRadius: 8, padding: 14, marginBottom: 10 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, flexWrap: "wrap", gap: 6 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <span style={{ fontSize: 11, fontWeight: 700, color: dirColor, textTransform: "uppercase" }}>
-            {box.direction === "bullish" ? "▲ Bullish box" : "▼ Bearish box"}
+          <span style={{ fontSize: 10, fontWeight: 700, color: meta?.color, textTransform: "uppercase", background: `${meta?.color}1A`, padding: "2px 8px", borderRadius: 4 }}>
+            {meta?.label}
           </span>
-          <span style={{ fontSize: 11, color: "#54575F" }}>{box.time}</span>
+          <span style={{ fontSize: 11, fontWeight: 700, color: dirColor }}>
+            {signal.direction === "bullish" ? "▲" : "▼"}
+          </span>
+          <span style={{ fontSize: 11, color: "#54575F" }}>{signal.time}</span>
         </div>
-        <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: "#6B6F7B" }}>
-          sweep {(box.penetration * 100).toFixed(0)}%
-        </span>
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 4, marginBottom: 10 }}>
-        {[0, 0.25, 0.5, 0.75, 1].map((lvl) => (
-          <div key={lvl} style={{
-            textAlign: "center", padding: "5px 2px", borderRadius: 4,
-            background: lvl === params.targetLevel ? `${accent}22` : "transparent",
-            border: lvl === params.targetLevel ? `1px solid ${accent}` : "1px solid #1E2128",
-          }}>
-            <div style={{ fontSize: 9, color: "#6B6F7B" }}>{lvl}</div>
-            <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 10.5, color: "#C8CAD3" }}>{fmt(box.levels[lvl], 2)}</div>
-          </div>
-        ))}
-      </div>
+
+      <div style={{ fontSize: 12, color: "#9A9DA8", marginBottom: 10 }}>{signal.detail}</div>
+
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10, fontSize: 12, color: "#9A9DA8" }}>
-        <span>Entry sugerat: <b style={{ color: "#E8E6E0" }}>{trade.direction}</b> @ {fmt(trade.entry, decimals ?? 2)}</span>
+        <span>Entry referință: <b style={{ color: "#E8E6E0" }}>{fmt(signal.entry, decimals ?? 2)}</b></span>
       </div>
 
       <button
         onClick={runAnalysis}
         disabled={loading || !candles || candles.length === 0}
         style={{
-          width: "100%", background: "transparent", border: `1px solid ${accent}`, color: accent,
+          width: "100%", background: "transparent", border: `1px solid ${meta?.color || "#2A2D35"}`, color: meta?.color || "#9A9DA8",
           borderRadius: 6, padding: "8px 12px", fontSize: 12, fontWeight: 600,
           cursor: loading ? "not-allowed" : "pointer", opacity: loading ? 0.6 : 1,
         }}
@@ -229,7 +249,7 @@ VERDICT: [INTRU ACUM / AȘTEPT / EVIT]`;
         </div>
       )}
 
-      {analysis && <AnalysisBlock text={analysis} accent={accent} />}
+      {analysis && <AnalysisBlock text={analysis} accent={meta?.color || "#9A9DA8"} />}
     </div>
   );
 }
@@ -276,7 +296,7 @@ function AnalysisBlock({ text, accent }) {
 
 function ScannerTab({ params, setParams }) {
   const [data, setData] = useState({ XAUUSD: null, SPX: null });
-  const [boxes, setBoxes] = useState({ XAUUSD: [], SPX: [] });
+  const [signals, setSignals] = useState({ XAUUSD: [], SPX: [] });
   const [candleHistory, setCandleHistory] = useState({ XAUUSD: [], SPX: [] });
   const [status, setStatus] = useState({ XAUUSD: "idle", SPX: "idle" });
   const [errorMsg, setErrorMsg] = useState({ XAUUSD: null, SPX: null });
@@ -285,6 +305,7 @@ function ScannerTab({ params, setParams }) {
   const [selectedInstrument, setSelectedInstrument] = useState("XAUUSD");
   const [showSettings, setShowSettings] = useState(false);
   const [windowStatus, setWindowStatus] = useState(null);
+  const [strategyFilter, setStrategyFilter] = useState("all");
   const intervalRef = useRef(null);
   const clockRef = useRef(null);
 
@@ -298,12 +319,21 @@ function ScannerTab({ params, setParams }) {
     const cfg = INSTRUMENTS[instrumentKey];
     setStatus((s) => ({ ...s, [instrumentKey]: "loading" }));
     try {
-      const res = await fetch(`/api/candles?symbol=${encodeURIComponent(cfg.symbol)}`);
-      const ts = await res.json();
-      if (!res.ok || ts.error) throw new Error(ts.error || "API error");
+      // 1h candles for most strategies, 4h candles for Rejection Block (higher timeframe)
+      const [res1h, res4h] = await Promise.all([
+        fetch(`/api/candles?symbol=${encodeURIComponent(cfg.symbol)}&interval=1h&outputsize=200`),
+        fetch(`/api/candles?symbol=${encodeURIComponent(cfg.symbol)}&interval=4h&outputsize=120`),
+      ]);
+      const ts = await res1h.json();
+      const ts4h = await res4h.json();
+      if (!res1h.ok || ts.error) throw new Error(ts.error || "API error");
       if (!ts.values || !ts.values.length) throw new Error("No data returned");
 
       const candles = ts.values
+        .map((v) => ({ time: v.datetime, open: parseFloat(v.open), high: parseFloat(v.high), low: parseFloat(v.low), close: parseFloat(v.close) }))
+        .reverse();
+
+      const htfCandles = (ts4h.values || [])
         .map((v) => ({ time: v.datetime, open: parseFloat(v.open), high: parseFloat(v.high), low: parseFloat(v.low), close: parseFloat(v.close) }))
         .reverse();
 
@@ -314,10 +344,9 @@ function ScannerTab({ params, setParams }) {
       const changePct = (change / prevClose) * 100;
       const sparkline = closes.slice(-40).map((c, i) => ({ i, v: c }));
 
-      const rawBoxes = detectDisplacements(candles, params);
-      const liveBoxes = markTestedLevels(rawBoxes, candles, params);
+      const unified = buildUnifiedSignals(candles, htfCandles, params);
 
-      setBoxes((b) => ({ ...b, [instrumentKey]: liveBoxes }));
+      setSignals((s) => ({ ...s, [instrumentKey]: unified }));
       setCandleHistory((h) => ({ ...h, [instrumentKey]: candles }));
       setData((d) => ({ ...d, [instrumentKey]: { price: latest, change, changePct, sparkline } }));
       setStatus((s) => ({ ...s, [instrumentKey]: "ok" }));
@@ -346,16 +375,8 @@ function ScannerTab({ params, setParams }) {
 
   const cfg = INSTRUMENTS[selectedInstrument];
   const d = data[selectedInstrument];
-  const instrumentBoxes = boxes[selectedInstrument] || [];
-  const liveBoxes = instrumentBoxes.filter((b) => b.live);
-  const activeSignals = useMemo(() => {
-    if (!d) return [];
-    return liveBoxes.filter((b) => {
-      const targetPrice = b.levels[params.targetLevel];
-      const tolerance = b.zoneSize * params.levelToleranceFraction;
-      return Math.abs(d.price - targetPrice) <= tolerance;
-    });
-  }, [liveBoxes, d, params]);
+  const allSignals = signals[selectedInstrument] || [];
+  const filteredSignals = strategyFilter === "all" ? allSignals : allSignals.filter((s) => s.strategy === strategyFilter);
 
   const activeWindows = windowStatus ? windowStatus.windows.filter((w) => w.isActive && (w.market === "ALL" || w.market === selectedInstrument)) : [];
 
@@ -437,38 +458,49 @@ function ScannerTab({ params, setParams }) {
         )}
       </div>
 
-      {activeSignals.length > 0 && (
-        <div style={{ marginBottom: 18 }}>
-          <div style={{ fontSize: 12, fontWeight: 700, color: "#4ADE80", marginBottom: 10, letterSpacing: "0.04em" }}>
-            ● SEMNAL ACTIV ({activeSignals.length})
-          </div>
-          {activeSignals.map((box, i) => (
-            <BoxCard key={i} box={box} params={params} accent={cfg.accent} highlighted
-              candles={candleHistory[selectedInstrument]} instrumentLabel={cfg.short} decimals={cfg.decimals}
-              windowStatus={windowStatus} />
-          ))}
-        </div>
-      )}
+      {/* Strategy filter chips */}
+      <div style={{ display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap" }}>
+        <FilterChip label={`Toate (${allSignals.length})`} active={strategyFilter === "all"} onClick={() => setStrategyFilter("all")} color="#9A9DA8" />
+        {Object.entries(STRATEGY_META).map(([key, meta]) => {
+          const count = allSignals.filter((s) => s.strategy === key).length;
+          return (
+            <FilterChip key={key} label={`${meta.label} (${count})`} active={strategyFilter === key} onClick={() => setStrategyFilter(key)} color={meta.color} />
+          );
+        })}
+      </div>
 
       <div>
         <div style={{ fontSize: 12, fontWeight: 700, color: "#9A9DA8", marginBottom: 10, letterSpacing: "0.04em" }}>
-          GRAN BOXES ACTIVE ({liveBoxes.length})
+          SEMNALE ACTIVE ({filteredSignals.length})
         </div>
         {status[selectedInstrument] === "loading" && !d && (
           <div style={{ color: "#6B6F7B", fontSize: 13, padding: "20px 0", textAlign: "center" }}>Se încarcă...</div>
         )}
-        {liveBoxes.length === 0 && status[selectedInstrument] === "ok" && (
+        {filteredSignals.length === 0 && status[selectedInstrument] === "ok" && (
           <div style={{ color: "#54575F", fontSize: 13, padding: "20px 0", textAlign: "center" }}>
-            Niciun gran box activ momentan pentru {cfg.short}.
+            Niciun semnal activ momentan pentru {cfg.short}{strategyFilter !== "all" ? ` (${STRATEGY_META[strategyFilter]?.label})` : ""}.
           </div>
         )}
-        {liveBoxes.slice(0, 8).map((box, i) => (
-          <BoxCard key={i} box={box} params={params} accent={cfg.accent}
-            candles={candleHistory[selectedInstrument]} instrumentLabel={cfg.short} decimals={cfg.decimals}
+        {filteredSignals.slice(0, 15).map((signal, i) => (
+          <SignalCard key={i} signal={signal} params={params} decimals={cfg.decimals}
+            candles={candleHistory[selectedInstrument]} instrumentLabel={cfg.short}
             windowStatus={windowStatus} />
         ))}
       </div>
     </div>
+  );
+}
+
+function FilterChip({ label, active, onClick, color }) {
+  return (
+    <button onClick={onClick} style={{
+      background: active ? `${color}22` : "transparent",
+      border: `1px solid ${active ? color : "#2A2D35"}`,
+      color: active ? color : "#6B6F7B",
+      borderRadius: 999, padding: "5px 12px", fontSize: 11.5, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap",
+    }}>
+      {label}
+    </button>
   );
 }
 
@@ -677,10 +709,33 @@ function StrategyTab({ params }) {
       <SectionCard title="Gran Box Strategy" accentColor="#D4AF37">
         <p style={pStyle}>Pe timeframe-ul de 1h, identificăm un candle de <b>displacement</b>. Marcăm o zonă ("gran box") folosind <b>doar body-ul candle-ului</b>.</p>
         <p style={pStyle}>Trasăm niveluri Fibonacci: 0, 0.25, 0.5, 0.75, 1. Așteptăm reacție la nivelul țintă (implicit <b>0.5</b>) pe TF mai mic.</p>
-      </SectionCard>
-      <SectionCard title="Validarea unui Box (Sweep)" accentColor="#4F8DFD">
         <p style={pStyle}>Box valid doar dacă displacement-ul penetrează ≥<b>{(params.sweepMinPenetration * 100).toFixed(0)}%</b> din candle-ul anterior.</p>
       </SectionCard>
+
+      <SectionCard title="Fair Value Gap (FVG)" accentColor="#4F8DFD">
+        <p style={pStyle}>Definiția ICT clasică: pe 3 candle-uri consecutive, dacă high-ul primului candle nu se suprapune cu low-ul celui de-al treilea (mișcare bullish), sau invers (bearish), zona dintre ele e un <b>imbalance</b>. Așteptăm ca prețul să revină și să reacționeze la umplerea gap-ului.</p>
+      </SectionCard>
+
+      <SectionCard title="Order Block" accentColor="#A78BFA">
+        <p style={pStyle}>Ultimul candle opus culorii înainte de un impuls puternic care sparge structura. Validat doar dacă trece toate cele <b>7 condiții</b>: fresh, impulsiv, sweep lichiditate anterioară, prim candle puternic, Break of Structure, origine zonă supply/demand, piață ne-ranging.</p>
+      </SectionCard>
+
+      <SectionCard title="Rejection Block" accentColor="#FB923C">
+        <p style={pStyle}>Pe timeframe mare (4h), un candle unde open-ul și close-ul sunt aproape identice (corp mic, fitile mari) arată o respingere puternică. Acel nivel exact (open≈close) e proiectat în timp ca linie de reacție pentru candle-urile viitoare — pozitiv (reacție în sus) sau negativ (reacție în jos).</p>
+      </SectionCard>
+
+      <SectionCard title="Power 3 (ICT)" accentColor="#34D399">
+        <p style={pStyle}>Modelul clasic de sesiune: <b>Accumulation</b> (range-ul sesiunii Asia) → <b>Manipulation</b> (London ia lichiditate de pe o parte a range-ului, fals breakout) → <b>Distribution/Expansion</b> (mișcarea reală, de obicei în sesiunea New York, în direcția opusă manipulării).</p>
+      </SectionCard>
+
+      <SectionCard title="Order Flow (basic)" accentColor="#F472B6">
+        <p style={pStyle}>Fără date reale de volum/bid-ask, aproximăm: structură de piață din swing highs/lows (Higher-High + Higher-Low = bullish; Lower-High + Lower-Low = bearish) combinată cu momentum din mărimea și direcția candle-urilor consecutive.</p>
+      </SectionCard>
+
+      <SectionCard title="Lichiditate — peste toate" accentColor="#EAB308">
+        <p style={pStyle}>Swing highs/lows nelichidate (neatinse încă de preț) sunt tratate ca zone prioritare — acolo stau probabil stop-loss-urile altora. Orice semnal (Gran Box, FVG, Order Block, Rejection Block) care se află aproape de o astfel de zonă e marcat ca <b>lângă lichiditate</b>, semn de confluență mai puternică.</p>
+      </SectionCard>
+
       <SectionCard title="Fereastra de timp" accentColor="#A78BFA">
         <RuleRow label="Gold — fereastră principală" value="11:00–13:00 RO și 17:00–19:00 RO" />
         <RuleRow label="Gold — ora 14 RO" value="Permis doar pe riscul propriu" />
@@ -696,6 +751,7 @@ function StrategyTab({ params }) {
       <SectionCard title="Risk Management" accentColor="#FB923C">
         <RuleRow label="Risc per trade" value="~1.3% din capitalul activ" />
         <RuleRow label="Target mediu" value="~20 pips" />
+        <RuleRow label="SL / TP" value="Stabilite contextual de analiza AI, nu formulă fixă" />
       </SectionCard>
       <div style={{ fontSize: 11.5, color: "#54575F", textAlign: "center", padding: "8px 16px 20px", lineHeight: 1.6 }}>
         Document de lucru personal. Nu este sfat financiar.
@@ -720,7 +776,7 @@ export default function Home() {
           <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: "0.12em", color: "#6B6F7B", textTransform: "uppercase", marginBottom: 4 }}>
             Personal Trading Desk
           </div>
-          <h1 style={{ fontSize: 21, fontWeight: 600, margin: 0 }}>Aurora — Gran Box</h1>
+          <h1 style={{ fontSize: 21, fontWeight: 600, margin: 0 }}>Aurora — Multi-Strategy Desk</h1>
         </div>
         <div style={{ height: 18 }} />
         <TabBar active={activeTab} onChange={setActiveTab} />
