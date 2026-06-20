@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { LineChart, Line, ResponsiveContainer, YAxis, Tooltip } from "recharts";
 import { Scan, History, Briefcase, BookOpen, RefreshCw, Settings2, Clock } from "lucide-react";
 import { detectDisplacements, markTestedLevels, suggestTradeFromBox, DEFAULT_PARAMS } from "./lib/granBoxLogic";
+import { runBacktest, PIP_SIZE_BY_SYMBOL } from "./lib/backtestEngine";
 import { getCurrentWindowStatus, fmtHourRo } from "./lib/timeWindows";
 
 const INSTRUMENTS = {
@@ -105,9 +106,78 @@ function ParamsPanel({ params, setParams }) {
   );
 }
 
-function BoxCard({ box, params, accent, highlighted }) {
+function BoxCard({ box, params, accent, highlighted, candles, instrumentLabel, decimals, windowStatus }) {
   const trade = suggestTradeFromBox(box, params);
   const dirColor = box.direction === "bullish" ? "#4ADE80" : "#F87171";
+  const [analysis, setAnalysis] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [analysisError, setAnalysisError] = useState(null);
+
+  const runAnalysis = async () => {
+    if (!candles || candles.length === 0) return;
+    setLoading(true);
+    setAnalysisError(null);
+    setAnalysis(null);
+    try {
+      // Give Claude the 40 candles surrounding the box (before + after) so it can see
+      // real swing highs/lows, wicks, and structure — not just the box in isolation.
+      const contextStart = Math.max(0, box.index - 25);
+      const contextEnd = Math.min(candles.length, box.index + 15);
+      const contextCandles = candles.slice(contextStart, contextEnd);
+      const candlesText = contextCandles
+        .map((c, i) => `${i}: ${c.time} O:${c.open} H:${c.high} L:${c.low} C:${c.close}`)
+        .join("\n");
+
+      const activeWindowsText = windowStatus
+        ? windowStatus.windows.filter((w) => w.isActive).map((w) => w.note).join(", ") || "în afara ferestrelor principale"
+        : "necunoscut";
+
+      const prompt = `Ești un trader experimentat care analizează un setup "Gran Box" pe ${instrumentLabel}.
+
+Strategia: pe un candle de displacement (impuls puternic) se marchează o zonă ("gran box") folosind doar body-ul candle-ului (open-close). Se trasează niveluri Fibonacci 0/0.25/0.5/0.75/1 peste acea zonă. Prețul a revenit/revine la nivelul țintă (${params.targetLevel}) pentru o posibilă intrare.
+
+Date despre acest box:
+- Direcție: ${box.direction === "bullish" ? "bullish (impuls în sus)" : "bearish (impuls în jos)"}
+- Box format la: ${box.time}
+- Zonă body: ${box.zoneLow} - ${box.zoneHigh}
+- Nivel țintă (entry candidat): ${box.levels[params.targetLevel]}
+- Sweep/penetrare în candle-ul anterior: ${(box.penetration * 100).toFixed(0)}%
+- Box testat deja: ${box.tested ? "da" : "nu"}
+
+Fereastra orară activă acum: ${activeWindowsText}
+
+Candle-uri din jur (index, ora, open, high, low, close), pentru context de structură/swing-uri:
+${candlesText}
+
+Analizează acest setup ca un trader uman: nu folosi o formulă fixă de SL/TP. Uită-te la swing high/low-urile reale din candle-urile de mai sus, la fitile, la structura din jurul box-ului, și decide unde ar sta logic un Stop Loss (unde setup-ul ar fi clar invalidat) și un Take Profit (următoarea zonă reală de lichiditate/structură), ținând cont de orice altceva relevant (impuls, context, fereastra orară).
+
+Scrie 4-6 propoziții explicând raționamentul ca un trader, apoi încheie STRICT cu acest bloc, completat cu valorile tale (fără alte adăugiri după el):
+
+ENTRY: [preț]
+SL: [preț] ([motiv scurt])
+TP: [preț] ([motiv scurt])
+ORA: [recomandare oră intrare, ținând cont de fereastra strategiei]
+VERDICT: [INTRU ACUM / AȘTEPT / EVIT]`;
+
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6",
+          max_tokens: 600,
+          messages: [{ role: "user", content: prompt }],
+        }),
+      });
+      const result = await response.json();
+      const text = result.content?.map((b) => (b.type === "text" ? b.text : "")).filter(Boolean).join("\n");
+      setAnalysis(text || "Niciun răspuns generat.");
+    } catch (err) {
+      setAnalysisError(err.message || "Analiza a eșuat");
+    } finally {
+      setLoading(false);
+    }
+  };
+
   return (
     <div style={{
       background: highlighted ? "rgba(74,222,128,0.06)" : "#101218",
@@ -137,9 +207,69 @@ function BoxCard({ box, params, accent, highlighted }) {
           </div>
         ))}
       </div>
-      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#9A9DA8" }}>
-        <span>Entry sugerat: <b style={{ color: "#E8E6E0" }}>{trade.direction}</b> @ {fmt(trade.entry, 2)}</span>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10, fontSize: 12, color: "#9A9DA8" }}>
+        <span>Entry sugerat: <b style={{ color: "#E8E6E0" }}>{trade.direction}</b> @ {fmt(trade.entry, decimals ?? 2)}</span>
       </div>
+
+      <button
+        onClick={runAnalysis}
+        disabled={loading || !candles || candles.length === 0}
+        style={{
+          width: "100%", background: "transparent", border: `1px solid ${accent}`, color: accent,
+          borderRadius: 6, padding: "8px 12px", fontSize: 12, fontWeight: 600,
+          cursor: loading ? "not-allowed" : "pointer", opacity: loading ? 0.6 : 1,
+        }}
+      >
+        {loading ? "Analizez setup-ul..." : "🔍 Analizează setup"}
+      </button>
+
+      {analysisError && (
+        <div style={{ marginTop: 10, fontSize: 11.5, color: "#E0664A", fontFamily: "'JetBrains Mono', monospace" }}>
+          {analysisError}
+        </div>
+      )}
+
+      {analysis && <AnalysisBlock text={analysis} accent={accent} />}
+    </div>
+  );
+}
+
+function AnalysisBlock({ text, accent }) {
+  // Split the free-text reasoning from the structured ENTRY/SL/TP/ORA/VERDICT block.
+  const splitIndex = text.search(/ENTRY:/i);
+  const reasoning = splitIndex >= 0 ? text.slice(0, splitIndex).trim() : text.trim();
+  const structured = splitIndex >= 0 ? text.slice(splitIndex).trim() : null;
+
+  const rows = structured
+    ? structured.split("\n").map((line) => {
+        const m = line.match(/^([A-ZĂÎȘȚ]+):\s*(.+)$/i);
+        return m ? { key: m[1].toUpperCase(), value: m[2] } : null;
+      }).filter(Boolean)
+    : [];
+
+  const verdictColor = (val) => {
+    if (/INTRU/i.test(val)) return "#4ADE80";
+    if (/EVIT/i.test(val)) return "#F87171";
+    return "#FBBF24";
+  };
+
+  return (
+    <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid #1A1C22" }}>
+      <p style={{ fontSize: 12.5, lineHeight: 1.65, color: "#C8CAD3", margin: "0 0 12px", whiteSpace: "pre-wrap" }}>
+        {reasoning}
+      </p>
+      {rows.length > 0 && (
+        <div style={{ background: "#0D0F14", border: `1px solid ${accent}33`, borderRadius: 6, padding: 12 }}>
+          {rows.map((r) => (
+            <div key={r.key} style={{ display: "flex", justifyContent: "space-between", gap: 10, padding: "4px 0", fontSize: 12 }}>
+              <span style={{ color: "#6B6F7B", fontWeight: 600, flexShrink: 0 }}>{r.key}</span>
+              <span style={{ color: r.key === "VERDICT" ? verdictColor(r.value) : "#E8E6E0", fontWeight: r.key === "VERDICT" ? 700 : 400, textAlign: "right", fontFamily: "'JetBrains Mono', monospace" }}>
+                {r.value}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -147,6 +277,7 @@ function BoxCard({ box, params, accent, highlighted }) {
 function ScannerTab({ params, setParams }) {
   const [data, setData] = useState({ XAUUSD: null, SPX: null });
   const [boxes, setBoxes] = useState({ XAUUSD: [], SPX: [] });
+  const [candleHistory, setCandleHistory] = useState({ XAUUSD: [], SPX: [] });
   const [status, setStatus] = useState({ XAUUSD: "idle", SPX: "idle" });
   const [errorMsg, setErrorMsg] = useState({ XAUUSD: null, SPX: null });
   const [lastUpdated, setLastUpdated] = useState(null);
@@ -187,6 +318,7 @@ function ScannerTab({ params, setParams }) {
       const liveBoxes = markTestedLevels(rawBoxes, candles, params);
 
       setBoxes((b) => ({ ...b, [instrumentKey]: liveBoxes }));
+      setCandleHistory((h) => ({ ...h, [instrumentKey]: candles }));
       setData((d) => ({ ...d, [instrumentKey]: { price: latest, change, changePct, sparkline } }));
       setStatus((s) => ({ ...s, [instrumentKey]: "ok" }));
       setErrorMsg((e) => ({ ...e, [instrumentKey]: null }));
@@ -310,7 +442,11 @@ function ScannerTab({ params, setParams }) {
           <div style={{ fontSize: 12, fontWeight: 700, color: "#4ADE80", marginBottom: 10, letterSpacing: "0.04em" }}>
             ● SEMNAL ACTIV ({activeSignals.length})
           </div>
-          {activeSignals.map((box, i) => <BoxCard key={i} box={box} params={params} accent={cfg.accent} highlighted />)}
+          {activeSignals.map((box, i) => (
+            <BoxCard key={i} box={box} params={params} accent={cfg.accent} highlighted
+              candles={candleHistory[selectedInstrument]} instrumentLabel={cfg.short} decimals={cfg.decimals}
+              windowStatus={windowStatus} />
+          ))}
         </div>
       )}
 
@@ -326,21 +462,57 @@ function ScannerTab({ params, setParams }) {
             Niciun gran box activ momentan pentru {cfg.short}.
           </div>
         )}
-        {liveBoxes.slice(0, 8).map((box, i) => <BoxCard key={i} box={box} params={params} accent={cfg.accent} />)}
+        {liveBoxes.slice(0, 8).map((box, i) => (
+          <BoxCard key={i} box={box} params={params} accent={cfg.accent}
+            candles={candleHistory[selectedInstrument]} instrumentLabel={cfg.short} decimals={cfg.decimals}
+            windowStatus={windowStatus} />
+        ))}
       </div>
     </div>
   );
 }
 
-function BacktestTab() {
+function BacktestTab({ params: strategyParams }) {
   const [running, setRunning] = useState(false);
   const [symbol, setSymbol] = useState("XAUUSD");
-  const [period, setPeriod] = useState("90");
+  const [outputsize, setOutputsize] = useState("500");
+  const [slPips, setSlPips] = useState(15);
+  const [tpPips, setTpPips] = useState(20);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState(null);
+  const [expandedTrade, setExpandedTrade] = useState(null);
+
+  const cfg = INSTRUMENTS[symbol];
+
+  const runIt = async () => {
+    setRunning(true);
+    setError(null);
+    setResult(null);
+    try {
+      const res = await fetch(`/api/candles?symbol=${encodeURIComponent(cfg.symbol)}&interval=1h&outputsize=${outputsize}`);
+      const ts = await res.json();
+      if (!res.ok || ts.error) throw new Error(ts.error || "API error");
+      if (!ts.values || !ts.values.length) throw new Error("Nu s-au returnat date pentru acest simbol/perioadă");
+
+      const candles = ts.values
+        .map((v) => ({ time: v.datetime, open: parseFloat(v.open), high: parseFloat(v.high), low: parseFloat(v.low), close: parseFloat(v.close) }))
+        .reverse();
+
+      const backtestParams = { slPips, tpPips, pipSize: PIP_SIZE_BY_SYMBOL[symbol] };
+      const { trades, summary } = runBacktest(candles, strategyParams, backtestParams, symbol);
+      setResult({ trades, summary, candleCount: candles.length });
+    } catch (err) {
+      setError(err.message || "Backtest failed");
+    } finally {
+      setRunning(false);
+    }
+  };
+
   return (
     <div>
       <div style={{ background: "#101218", border: "1px solid #1E2128", borderRadius: 10, padding: 20, marginBottom: 18 }}>
         <div style={{ fontSize: 11, color: "#6B6F7B", marginBottom: 14, letterSpacing: "0.06em", textTransform: "uppercase" }}>Configurare backtest</div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 16 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
           <div>
             <div style={{ fontSize: 11, color: "#9A9DA8", marginBottom: 4 }}>Simbol</div>
             <select value={symbol} onChange={(e) => setSymbol(e.target.value)} style={selectStyle}>
@@ -349,21 +521,122 @@ function BacktestTab() {
             </select>
           </div>
           <div>
-            <div style={{ fontSize: 11, color: "#9A9DA8", marginBottom: 4 }}>Perioadă (zile)</div>
-            <select value={period} onChange={(e) => setPeriod(e.target.value)} style={selectStyle}>
-              <option value="30">30 zile</option>
-              <option value="90">90 zile</option>
-              <option value="180">180 zile</option>
+            <div style={{ fontSize: 11, color: "#9A9DA8", marginBottom: 4 }}>Nr. candle-uri 1h istorice</div>
+            <select value={outputsize} onChange={(e) => setOutputsize(e.target.value)} style={selectStyle}>
+              <option value="200">200 (~8 zile)</option>
+              <option value="500">500 (~20 zile)</option>
+              <option value="1000">1000 (~42 zile)</option>
+              <option value="2500">2500 (~100 zile)</option>
             </select>
           </div>
         </div>
-        <button onClick={() => setRunning(true)} style={{ background: "#D4AF37", color: "#0A0B0D", border: "none", borderRadius: 6, padding: "10px 18px", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>
-          Run Backtest
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 16 }}>
+          <div>
+            <div style={{ fontSize: 11, color: "#9A9DA8", marginBottom: 4 }}>SL (pips)</div>
+            <input type="number" value={slPips} onChange={(e) => setSlPips(parseFloat(e.target.value))} style={selectStyle} />
+          </div>
+          <div>
+            <div style={{ fontSize: 11, color: "#9A9DA8", marginBottom: 4 }}>TP (pips)</div>
+            <input type="number" value={tpPips} onChange={(e) => setTpPips(parseFloat(e.target.value))} style={selectStyle} />
+          </div>
+        </div>
+        <button
+          onClick={runIt}
+          disabled={running}
+          style={{ background: "#D4AF37", color: "#0A0B0D", border: "none", borderRadius: 6, padding: "10px 18px", fontWeight: 700, fontSize: 13, cursor: running ? "not-allowed" : "pointer", opacity: running ? 0.6 : 1 }}
+        >
+          {running ? "Se rulează..." : "Run Backtest"}
         </button>
+        <div style={{ fontSize: 11, color: "#54575F", marginTop: 10, lineHeight: 1.5 }}>
+          Notă: planul gratuit Twelve Data limitează cantitatea de istoric disponibilă — un volum mare de candle-uri poate eșua sau consuma rapid limita zilnică.
+        </div>
       </div>
-      <div style={{ textAlign: "center", color: "#54575F", fontSize: 13, padding: "40px 20px" }}>
-        {running ? "Motorul de backtest urmează în pasul următor." : "Configurează parametrii și rulează un backtest. (În lucru.)"}
+
+      {error && (
+        <div style={{ background: "rgba(224,102,74,0.08)", border: "1px solid rgba(224,102,74,0.3)", borderRadius: 8, padding: 14, marginBottom: 18, color: "#E0664A", fontSize: 12.5, fontFamily: "'JetBrains Mono', monospace" }}>
+          {error}
+        </div>
+      )}
+
+      {result && (
+        <>
+          <SummaryGrid summary={result.summary} candleCount={result.candleCount} />
+          <div style={{ fontSize: 12, fontWeight: 700, color: "#9A9DA8", margin: "20px 0 10px", letterSpacing: "0.04em" }}>
+            TRANZACȚII SIMULATE ({result.trades.length})
+          </div>
+          {result.trades.length === 0 && (
+            <div style={{ color: "#54575F", fontSize: 13, padding: "20px 0", textAlign: "center" }}>
+              Niciun gran box testat în perioada selectată. Încearcă mai mult istoric.
+            </div>
+          )}
+          {result.trades.map((t, i) => (
+            <TradeRow key={i} trade={t} cfg={cfg} expanded={expandedTrade === i} onToggle={() => setExpandedTrade(expandedTrade === i ? null : i)} />
+          ))}
+        </>
+      )}
+    </div>
+  );
+}
+
+function SummaryGrid({ summary, candleCount }) {
+  const cards = [
+    { label: "Win rate", value: `${summary.winRate.toFixed(1)}%`, color: summary.winRate >= 50 ? "#4ADE80" : "#F87171" },
+    { label: "Trades", value: `${summary.totalTrades}`, color: "#E8E6E0" },
+    { label: "Win / Loss", value: `${summary.wins} / ${summary.losses}`, color: "#E8E6E0" },
+    { label: "Pips total", value: fmtSigned(summary.totalPips, 1), color: summary.totalPips >= 0 ? "#4ADE80" : "#F87171" },
+  ];
+  return (
+    <div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 10 }}>
+        {cards.map((c) => (
+          <div key={c.label} style={{ background: "#101218", border: "1px solid #1E2128", borderRadius: 8, padding: 14 }}>
+            <div style={{ fontSize: 11, color: "#6B6F7B", marginBottom: 6 }}>{c.label}</div>
+            <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 19, fontWeight: 600, color: c.color }}>{c.value}</div>
+          </div>
+        ))}
       </div>
+      <div style={{ fontSize: 11, color: "#54575F", marginTop: 8, textAlign: "right" }}>
+        bazat pe {candleCount} candle-uri 1h · {summary.open} tranzacții încă deschise la finalul datelor
+      </div>
+    </div>
+  );
+}
+
+function TradeRow({ trade, cfg, expanded, onToggle }) {
+  const resultColor = trade.result === "win" ? "#4ADE80" : trade.result === "loss" ? "#F87171" : "#9A9DA8";
+  const resultLabel = trade.result === "win" ? "WIN" : trade.result === "loss" ? "LOSS" : "OPEN";
+  return (
+    <div onClick={onToggle} style={{ background: "#101218", border: "1px solid #1E2128", borderRadius: 8, padding: 12, marginBottom: 8, cursor: "pointer" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 10.5, fontWeight: 700, color: trade.direction === "LONG" ? "#4ADE80" : "#F87171" }}>{trade.direction}</span>
+          <span style={{ fontSize: 11.5, color: "#9A9DA8" }}>{trade.entryTime}</span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: resultColor, fontWeight: 700 }}>{resultLabel}</span>
+          <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: trade.pips >= 0 ? "#4ADE80" : "#F87171" }}>{fmtSigned(trade.pips, 1)}p</span>
+        </div>
+      </div>
+      {expanded && (
+        <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px solid #1A1C22", display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, fontSize: 11.5 }}>
+          <DetailItem label="Entry" value={fmt(trade.entry, cfg.decimals)} />
+          <DetailItem label="SL" value={fmt(trade.sl, cfg.decimals)} />
+          <DetailItem label="TP" value={fmt(trade.tp, cfg.decimals)} />
+          <DetailItem label="Exit" value={trade.exitPrice ? fmt(trade.exitPrice, cfg.decimals) : "—"} />
+          <DetailItem label="Box format la" value={trade.boxTime} />
+          <DetailItem label="Exit la" value={trade.exitTime || "—"} />
+          <DetailItem label="Sweep penetrare" value={`${(trade.sweepPenetration * 100).toFixed(0)}%`} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DetailItem({ label, value }) {
+  return (
+    <div>
+      <div style={{ color: "#6B6F7B", fontSize: 10.5, marginBottom: 2 }}>{label}</div>
+      <div style={{ color: "#C8CAD3", fontFamily: "'JetBrains Mono', monospace" }}>{value}</div>
     </div>
   );
 }
@@ -452,7 +725,7 @@ export default function Home() {
         <div style={{ height: 18 }} />
         <TabBar active={activeTab} onChange={setActiveTab} />
         {activeTab === "scanner" && <ScannerTab params={params} setParams={setParams} />}
-        {activeTab === "backtest" && <BacktestTab />}
+        {activeTab === "backtest" && <BacktestTab params={params} />}
         {activeTab === "trades" && <MyTradesTab />}
         {activeTab === "strategy" && <StrategyTab params={params} />}
         <div style={{ marginTop: 28, fontSize: 11, color: "#54575F", lineHeight: 1.6, textAlign: "center" }}>

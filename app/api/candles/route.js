@@ -4,10 +4,15 @@
 export async function GET(request) {
   const { searchParams } = new URL(request.url);
   const symbol = searchParams.get("symbol");
+  const outputsize = searchParams.get("outputsize") || "200";
+  const interval = searchParams.get("interval") || "1h";
 
   if (!symbol) {
     return Response.json({ error: "Missing symbol parameter" }, { status: 400 });
   }
+
+  // Twelve Data free tier caps outputsize; clamp to a sane max to avoid wasted credits.
+  const safeOutputsize = Math.min(parseInt(outputsize, 10) || 200, 5000);
 
   const apiKey = process.env.TWELVE_DATA_API_KEY;
   if (!apiKey) {
@@ -20,7 +25,7 @@ export async function GET(request) {
   try {
     const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(
       symbol
-    )}&interval=1h&outputsize=200&apikey=${apiKey}`;
+    )}&interval=${encodeURIComponent(interval)}&outputsize=${safeOutputsize}&apikey=${apiKey}`;
 
     const res = await fetch(url, { next: { revalidate: 0 } });
     const data = await res.json();
