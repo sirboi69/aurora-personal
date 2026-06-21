@@ -141,6 +141,11 @@ Expansion: ${r.expansion ? `${r.expansion.active ? "activă" : "în așteptare"}
 Bias structură: ${r.structureBias}
 Candle-uri consecutive în aceeași direcție: ${r.consecutiveCount}
 Accelerare momentum: ${r.accelerating ? "da" : "nu"}`;
+    case "orb":
+      return `Strategia "ORB" (Opening Range Breakout, varianta Value Area): pe primele 3 candle-uri de 5m ale sesiunii (9:30-9:45 NY) se calculează o Value Area aproximată (VAH/VAL/POC) — NOTĂ: aproximare din OHLC, nu Volume Profile real cu tick data.
+Setup: ${r.setupType === "fakeout" ? "FAKEOUT (reversal) — prețul a spart range-ul, a luat lichiditate, apoi a revenit în Value Area" : "BREAKOUT (continuare) — închidere clară în afara Value Area"}
+VAH: ${r.valueArea?.vah?.toFixed(2)} · VAL: ${r.valueArea?.val?.toFixed(2)} · POC: ${r.valueArea?.poc?.toFixed(2)}
+Entry: ${r.entry?.toFixed(2)} · SL sugerat de logică: ${r.sl?.toFixed(2)} · TP sugerat de logică: ${r.tp?.toFixed(2)}`;
     default:
       return "";
   }
@@ -319,13 +324,15 @@ function ScannerTab({ params, setParams }) {
     const cfg = INSTRUMENTS[instrumentKey];
     setStatus((s) => ({ ...s, [instrumentKey]: "loading" }));
     try {
-      // 1h candles for most strategies, 4h candles for Rejection Block (higher timeframe)
-      const [res1h, res4h] = await Promise.all([
+      // 1h candles for most strategies, 4h for Rejection Block, 5m (today) for ORB
+      const [res1h, res4h, res5m] = await Promise.all([
         fetch(`/api/candles?symbol=${encodeURIComponent(cfg.symbol)}&interval=1h&outputsize=200`),
         fetch(`/api/candles?symbol=${encodeURIComponent(cfg.symbol)}&interval=4h&outputsize=120`),
+        fetch(`/api/candles?symbol=${encodeURIComponent(cfg.symbol)}&interval=5min&outputsize=100`),
       ]);
       const ts = await res1h.json();
       const ts4h = await res4h.json();
+      const ts5m = await res5m.json();
       if (!res1h.ok || ts.error) throw new Error(ts.error || "API error");
       if (!ts.values || !ts.values.length) throw new Error("No data returned");
 
@@ -337,6 +344,10 @@ function ScannerTab({ params, setParams }) {
         .map((v) => ({ time: v.datetime, open: parseFloat(v.open), high: parseFloat(v.high), low: parseFloat(v.low), close: parseFloat(v.close) }))
         .reverse();
 
+      const candles5m = (ts5m.values || [])
+        .map((v) => ({ time: v.datetime, open: parseFloat(v.open), high: parseFloat(v.high), low: parseFloat(v.low), close: parseFloat(v.close), volume: v.volume ? parseFloat(v.volume) : 0 }))
+        .reverse();
+
       const closes = candles.map((c) => c.close);
       const latest = closes[closes.length - 1];
       const prevClose = closes[closes.length - 2] ?? latest;
@@ -344,7 +355,7 @@ function ScannerTab({ params, setParams }) {
       const changePct = (change / prevClose) * 100;
       const sparkline = closes.slice(-40).map((c, i) => ({ i, v: c }));
 
-      const unified = buildUnifiedSignals(candles, htfCandles, params);
+      const unified = buildUnifiedSignals(candles, htfCandles, params, candles5m);
 
       setSignals((s) => ({ ...s, [instrumentKey]: unified }));
       setCandleHistory((h) => ({ ...h, [instrumentKey]: candles }));
@@ -730,6 +741,17 @@ function StrategyTab({ params }) {
 
       <SectionCard title="Order Flow (basic)" accentColor="#F472B6">
         <p style={pStyle}>Fără date reale de volum/bid-ask, aproximăm: structură de piață din swing highs/lows (Higher-High + Higher-Low = bullish; Lower-High + Lower-Low = bearish) combinată cu momentum din mărimea și direcția candle-urilor consecutive.</p>
+      </SectionCard>
+
+      <SectionCard title="ORB — Opening Range Breakout (Value Area)" accentColor="#22D3EE">
+        <p style={pStyle}>Opening Range marcat pe primele 3 candle-uri de 5m (09:30–09:45 NY). În loc de simplul high/low, se calculează o <b>Value Area aproximată</b> (VAH/VAL/POC) — zona unde s-ar fi tranzacționat ~70% din volum.</p>
+        <p style={pStyle}><b>Notă:</b> Twelve Data nu oferă volum real pe niveluri de preț (tick data), deci VAH/VAL/POC sunt o aproximare calculată din OHLC (body ponderat mai greu decât fitilele), nu Volume Profile exact.</p>
+        <RuleRow label="Fakeout (reversal)" value="Spargere range → atinge lichiditate → închidere 5m înapoi în VA → intrare inversă" />
+        <RuleRow label="Fakeout SL" value="Peste/sub lumânarea de confirmare" />
+        <RuleRow label="Fakeout TP" value="Partea opusă a range-ului / următoarea lichiditate" />
+        <RuleRow label="Breakout (continuare)" value="Trend clar sau sweep anterior + închidere 5m în afara VA" />
+        <RuleRow label="Breakout SL" value="2 ticks peste/sub POC" />
+        <RuleRow label="Breakout TP" value="2R fix" />
       </SectionCard>
 
       <SectionCard title="Lichiditate — peste toate" accentColor="#EAB308">

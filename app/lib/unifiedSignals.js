@@ -10,6 +10,7 @@ import { detectRejectionBlocks, markRejectionStatus } from "./rejectionBlockLogi
 import { detectPower3Setups } from "./power3Logic";
 import { getOrderFlowSnapshot } from "./orderFlowLogic";
 import { detectLiquidityPools, isNearLiquidity } from "./liquidityLogic";
+import { detectOrbSetup, evaluateOrbSetups } from "./orbLogic";
 
 export const STRATEGY_META = {
   granbox: { label: "Gran Box", color: "#D4AF37" },
@@ -18,9 +19,10 @@ export const STRATEGY_META = {
   rejectionblock: { label: "Rejection Block", color: "#FB923C" },
   power3: { label: "Power 3", color: "#34D399" },
   orderflow: { label: "Order Flow", color: "#F472B6" },
+  orb: { label: "ORB", color: "#22D3EE" },
 };
 
-export function buildUnifiedSignals(candles, htfCandles = [], granBoxParams = {}) {
+export function buildUnifiedSignals(candles, htfCandles = [], granBoxParams = {}, candles5m = []) {
   if (!candles || candles.length < 30) {
     return [];
   }
@@ -101,7 +103,24 @@ export function buildUnifiedSignals(candles, htfCandles = [], granBoxParams = {}
     });
   }
 
-  allSignals = allSignals.concat(granBoxes, fvgs, orderBlocks, power3Setups, orderFlowSignals);
+  // --- ORB (5m, today's session only) ---
+  let orbSignals = [];
+  if (candles5m && candles5m.length >= 10) {
+    const orbSetup = detectOrbSetup(candles5m);
+    if (orbSetup) {
+      const orbResults = evaluateOrbSetups(orbSetup, candles5m);
+      orbSignals = orbResults.map((r) => ({
+        strategy: "orb",
+        direction: r.direction,
+        time: r.time,
+        entry: r.entry,
+        detail: r.detail,
+        raw: { ...r, valueArea: orbSetup.valueArea, day: orbSetup.day },
+      }));
+    }
+  }
+
+  allSignals = allSignals.concat(granBoxes, fvgs, orderBlocks, power3Setups, orderFlowSignals, orbSignals);
 
   allSignals = allSignals.map((s) => ({
     ...s,
