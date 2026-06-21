@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { LineChart, Line, ResponsiveContainer, YAxis, Tooltip } from "recharts";
-import { Scan, History, Briefcase, BookOpen, RefreshCw, Settings2, Clock, Newspaper } from "lucide-react";
+import { Scan, History, Briefcase, BookOpen, RefreshCw, Settings2, Clock } from "lucide-react";
 import { DEFAULT_PARAMS } from "./lib/granBoxLogic";
 import { buildUnifiedSignals, STRATEGY_META } from "./lib/unifiedSignals";
 import { runBacktest, PIP_SIZE_BY_SYMBOL } from "./lib/backtestEngine";
@@ -36,7 +36,6 @@ const TABS = [
   { id: "backtest", label: "Backtest", icon: History },
   { id: "trades", label: "My Trades", icon: Briefcase },
   { id: "strategy", label: "Strategy", icon: BookOpen },
-  { id: "news", label: "Știri", icon: Newspaper },
 ];
 
 function TabBar({ active, onChange }) {
@@ -147,7 +146,10 @@ Accelerare momentum: ${r.accelerating ? "da" : "nu"}`;
 Setup: ${r.setupType === "fakeout" ? "FAKEOUT (reversal) — prețul a spart range-ul, a luat lichiditate, apoi a revenit în Value Area" : "BREAKOUT (continuare) — închidere clară în afara Value Area"}
 VAH: ${r.valueArea?.vah?.toFixed(2)} · VAL: ${r.valueArea?.val?.toFixed(2)} · POC: ${r.valueArea?.poc?.toFixed(2)}
 Entry: ${r.entry?.toFixed(2)} · SL sugerat de logică: ${r.sl?.toFixed(2)} · TP sugerat de logică: ${r.tp?.toFixed(2)}`;
-  
+    case "choch":
+      return `Strategia "ChoCh" (Change of Character): schimbare de structură de piață, diferită de BOS (care confirmă continuarea trendului). ChoCh marchează momentul exact când o secvență bullish (Higher-High/Higher-Low) se rupe într-un Lower-Low, sau o secvență bearish (Lower-High/Lower-Low) se rupe într-un Higher-High — primul semn obiectiv de potențială întoarcere de trend.
+${r.detail}
+Nivel rupt: ${r.brokenLevel?.toFixed(2)} · Noul preț: ${r.newPrice?.toFixed(2)}`;
     case "usdxdivergence":
       return `Strategia "Smart Money Divergence vs USDX": XAUUSD/instrumentul și USDX (indicele dolarului) se mișcă normal invers (corelație negativă). Când USDX face un nou swing high/low dar instrumentul NU confirmă cu mișcarea inversă așteptată, relația normală s-a rupt — semnal de epuizare sau întoarcere posibilă.
 ${r.detail}
@@ -305,38 +307,19 @@ function AnalysisBlock({ text, accent }) {
   );
 }
 
-// Cache la nivel de modul (NU resetat la schimbarea de tab, doar la reload de pagină).
-// Twelve Data free plan permite doar 8 credite/minut — fără cache-ul ăsta, fiecare
-// switch între tab-uri remonta ScannerTab și declanșa un refetch complet (7 cereri).
-const scannerCache = {
-  data: { XAUUSD: null, SPX: null },
-  signals: { XAUUSD: [], SPX: [] },
-  candleHistory: { XAUUSD: [], SPX: [] },
-  raw: { XAUUSD: null, SPX: null }, // { candles, htfCandles, candles5m } — pentru recalcul local la schimbarea parametrilor
-  usdxCandles: [],
-  fetchedAt: { XAUUSD: 0, SPX: 0, DXY: 0 },
-};
-const AUTO_REFRESH_MS = 5 * 60 * 1000; // 5 minute (era 1 minut — prea des pentru planul gratuit)
-const STALE_AFTER_MS = 90 * 1000; // date sub 90s vechime nu se mai re-cer (ex. la revenire pe tab)
-
 function ScannerTab({ params, setParams }) {
-  const [data, setData] = useState(scannerCache.data);
-  const [signals, setSignals] = useState(scannerCache.signals);
-  const [candleHistory, setCandleHistory] = useState(scannerCache.candleHistory);
-  const [status, setStatus] = useState({
-    XAUUSD: scannerCache.data.XAUUSD ? "ok" : "idle",
-    SPX: scannerCache.data.SPX ? "ok" : "idle",
-  });
+  const [data, setData] = useState({ XAUUSD: null, SPX: null });
+  const [signals, setSignals] = useState({ XAUUSD: [], SPX: [] });
+  const [candleHistory, setCandleHistory] = useState({ XAUUSD: [], SPX: [] });
+  const [status, setStatus] = useState({ XAUUSD: "idle", SPX: "idle" });
   const [errorMsg, setErrorMsg] = useState({ XAUUSD: null, SPX: null });
-  const [lastUpdated, setLastUpdated] = useState(
-    Math.max(scannerCache.fetchedAt.XAUUSD, scannerCache.fetchedAt.SPX) > 0
-      ? new Date(Math.max(scannerCache.fetchedAt.XAUUSD, scannerCache.fetchedAt.SPX))
-      : null
-  );
-  const [autoRefresh, setAutoRefresh] = useState(true);
+  const [lastUpdated, setLastUpdated] = useState(null);
+  const [autoRefresh, setAutoRefresh] = useState(false);
   const [selectedInstrument, setSelectedInstrument] = useState("XAUUSD");
   const [showSettings, setShowSettings] = useState(false);
   const [windowStatus, setWindowStatus] = useState(null);
+  const [refreshCooldown, setRefreshCooldown] = useState(0);
+  const cooldownIntervalRef = useRef(null);
   const [strategyFilter, setStrategyFilter] = useState("all");
   const intervalRef = useRef(null);
   const clockRef = useRef(null);
@@ -353,9 +336,9 @@ function ScannerTab({ params, setParams }) {
     try {
       // 1h candles for most strategies, 4h for Rejection Block, 5m (today) for ORB
       const [res1h, res4h, res5m] = await Promise.all([
-        fetch(`/api/candles?symbol=${encodeURIComponent(cfg.symbol)}&interval=1h&outputsize=200`),
-        fetch(`/api/candles?symbol=${encodeURIComponent(cfg.symbol)}&interval=4h&outputsize=120`),
-        fetch(`/api/candles?symbol=${encodeURIComponent(cfg.symbol)}&interval=5min&outputsize=100`),
+        fetch(`/api/candles?symbol=${encodeURIComponent(cfg.symbol)}&interval=1h&outputsize=100`),
+        fetch(`/api/candles?symbol=${encodeURIComponent(cfg.symbol)}&interval=4h&outputsize=60`),
+        fetch(`/api/candles?symbol=${encodeURIComponent(cfg.symbol)}&interval=5min&outputsize=60`),
       ]);
       const ts = await res1h.json();
       const ts4h = await res4h.json();
@@ -384,12 +367,6 @@ function ScannerTab({ params, setParams }) {
 
       const unified = buildUnifiedSignals(candles, htfCandles, params, candles5m, usdxCandles || []);
 
-      scannerCache.signals[instrumentKey] = unified;
-      scannerCache.candleHistory[instrumentKey] = candles;
-      scannerCache.raw[instrumentKey] = { candles, htfCandles, candles5m };
-      scannerCache.data[instrumentKey] = { price: latest, change, changePct, sparkline };
-      scannerCache.fetchedAt[instrumentKey] = Date.now();
-
       setSignals((s) => ({ ...s, [instrumentKey]: unified }));
       setCandleHistory((h) => ({ ...h, [instrumentKey]: candles }));
       setData((d) => ({ ...d, [instrumentKey]: { price: latest, change, changePct, sparkline } }));
@@ -401,60 +378,63 @@ function ScannerTab({ params, setParams }) {
     }
   }, [params]);
 
-  // refreshAll acum cere DOAR instrumentele indicate (implicit doar cel activ, nu ambele),
-  // și sare peste cele cu date mai noi de STALE_AFTER_MS — evită cererile duble la
-  // schimbarea rapidă între tab-uri (Scanner -> Știri -> Scanner etc.)
-  const refreshAll = useCallback(async (instrumentKeys, force = false) => {
-    const keys = instrumentKeys || [selectedInstrument];
-    const now = Date.now();
-    const needsFetch = keys.filter((k) => force || now - (scannerCache.fetchedAt[k] || 0) > STALE_AFTER_MS);
-    if (needsFetch.length === 0) return;
-
-    let usdxCandles = scannerCache.usdxCandles;
-    if (force || now - scannerCache.fetchedAt.DXY > STALE_AFTER_MS) {
-      try {
-        const resDxy = await fetch(`/api/candles?symbol=DXY&interval=1h&outputsize=200`);
-        const tsDxy = await resDxy.json();
-        if (resDxy.ok && tsDxy.values && tsDxy.values.length) {
-          usdxCandles = tsDxy.values
-            .map((v) => ({ time: v.datetime, open: parseFloat(v.open), high: parseFloat(v.high), low: parseFloat(v.low), close: parseFloat(v.close) }))
-            .reverse();
-          scannerCache.usdxCandles = usdxCandles;
-          scannerCache.fetchedAt.DXY = Date.now();
-        }
-      } catch (e) {
-        // USDX fetch failing shouldn't block the rest of the scanner — divergence signals just won't appear
+  const doRefresh = useCallback(async () => {
+    // Fetch USDX (DXY) once and share it across both instruments for divergence comparison
+    let usdxCandles = [];
+    try {
+      const resDxy = await fetch(`/api/candles?symbol=DXY&interval=1h&outputsize=100`);
+      const tsDxy = await resDxy.json();
+      if (resDxy.ok && tsDxy.values && tsDxy.values.length) {
+        usdxCandles = tsDxy.values
+          .map((v) => ({ time: v.datetime, open: parseFloat(v.open), high: parseFloat(v.high), low: parseFloat(v.low), close: parseFloat(v.close) }))
+          .reverse();
       }
+    } catch (e) {
+      // USDX fetch failing shouldn't block the rest of the scanner — divergence signals just won't appear
     }
 
-    await Promise.all(needsFetch.map((k) => fetchInstrument(k, usdxCandles)));
+    await Promise.all([fetchInstrument("XAUUSD", usdxCandles), fetchInstrument("SPX", usdxCandles)]);
     setLastUpdated(new Date());
-  }, [fetchInstrument, selectedInstrument]);
+  }, [fetchInstrument]);
 
-  // La schimbarea parametrilor strategiei: recalculează semnalele DOAR din candle-urile
-  // deja descărcate (zero cereri API) — important acum că refreshAll sare peste cererile
-  // "prea recente", ca recalcularea să nu rămână blocată de gate-ul de staleness.
-  useEffect(() => {
-    Object.entries(scannerCache.raw).forEach(([key, raw]) => {
-      if (!raw) return;
-      const unified = buildUnifiedSignals(raw.candles, raw.htfCandles, params, raw.candles5m, scannerCache.usdxCandles);
-      scannerCache.signals[key] = unified;
-      setSignals((s) => ({ ...s, [key]: unified }));
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [params]);
+  // Throttled wrapper: this app fires up to 7 Twelve Data requests per full refresh
+  // (1h+4h+5min × 2 instruments + 1 shared DXY). The free plan caps at ~8 credits/minute,
+  // so refreshes are throttled to one every REFRESH_COOLDOWN_SECONDS to avoid hitting the
+  // rate limit, regardless of how often the user clicks Refresh or toggles auto-refresh.
+  const REFRESH_COOLDOWN_SECONDS = 25;
 
-  // La montare: cere doar instrumentul activ (lazy — celălalt se cere când e selectat)
-  useEffect(() => { refreshAll(); }, [refreshAll]);
+  const startCooldown = useCallback(() => {
+    setRefreshCooldown(REFRESH_COOLDOWN_SECONDS);
+    if (cooldownIntervalRef.current) clearInterval(cooldownIntervalRef.current);
+    cooldownIntervalRef.current = setInterval(() => {
+      setRefreshCooldown((c) => {
+        if (c <= 1) {
+          clearInterval(cooldownIntervalRef.current);
+          return 0;
+        }
+        return c - 1;
+      });
+    }, 1000);
+  }, []);
+
+  const refreshAll = useCallback(async () => {
+    if (refreshCooldown > 0) return; // throttled — ignore extra clicks/triggers
+    startCooldown();
+    await doRefresh();
+  }, [refreshCooldown, startCooldown, doRefresh]);
+
+  useEffect(() => { refreshAll(); }, []); // initial load only
 
   useEffect(() => {
     if (!autoRefresh) {
       if (intervalRef.current) clearInterval(intervalRef.current);
       return;
     }
-    intervalRef.current = setInterval(() => refreshAll([selectedInstrument], true), AUTO_REFRESH_MS);
+    // Auto-refresh interval is intentionally longer than the cooldown so it never gets
+    // silently skipped by the throttle.
+    intervalRef.current = setInterval(() => refreshAll(), 90000);
     return () => clearInterval(intervalRef.current);
-  }, [autoRefresh, refreshAll, selectedInstrument]);
+  }, [autoRefresh, refreshAll]);
 
   const cfg = INSTRUMENTS[selectedInstrument];
   const d = data[selectedInstrument];
@@ -471,7 +451,7 @@ function ScannerTab({ params, setParams }) {
             const c = INSTRUMENTS[key];
             const isSel = selectedInstrument === key;
             return (
-              <button key={key} onClick={() => { setSelectedInstrument(key); refreshAll([key]); }} style={{
+              <button key={key} onClick={() => setSelectedInstrument(key)} style={{
                 background: isSel ? c.accentDim : "transparent",
                 border: `1px solid ${isSel ? c.accent : "#2A2D35"}`,
                 color: isSel ? c.accent : "#9A9DA8",
@@ -485,8 +465,16 @@ function ScannerTab({ params, setParams }) {
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
           <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: "#6B6F7B" }}>
             {lastUpdated ? `Updated ${lastUpdated.toLocaleTimeString()}` : "Fetching..."}
+            {refreshCooldown > 0 && ` · refresh în ${refreshCooldown}s`}
           </span>
-          <button onClick={() => refreshAll([selectedInstrument], true)} style={iconBtnStyle}><RefreshCw size={14} /></button>
+          <button
+            onClick={refreshAll}
+            disabled={refreshCooldown > 0}
+            style={{ ...iconBtnStyle, opacity: refreshCooldown > 0 ? 0.4 : 1, cursor: refreshCooldown > 0 ? "not-allowed" : "pointer" }}
+            title={refreshCooldown > 0 ? `Așteaptă ${refreshCooldown}s (limită API)` : "Refresh"}
+          >
+            <RefreshCw size={14} />
+          </button>
           <button onClick={() => setShowSettings((s) => !s)} style={iconBtnStyle}><Settings2 size={14} /></button>
         </div>
       </div>
@@ -826,7 +814,9 @@ function StrategyTab({ params }) {
         <RuleRow label="Breakout TP" value="2R fix" />
       </SectionCard>
 
-   
+      <SectionCard title="ChoCh — Change of Character" accentColor="#C084FC">
+        <p style={pStyle}>Diferit de BOS (care confirmă <b>continuarea</b> trendului), ChoCh marchează momentul exact când structura de piață se <b>schimbă</b>: o secvență bullish (Higher-High + Higher-Low) se rupe într-un Lower-Low, sau o secvență bearish (Lower-High + Lower-Low) se rupe într-un Higher-High. E primul semn obiectiv de potențială întoarcere de trend.</p>
+      </SectionCard>
 
       <SectionCard title="Smart Money Divergence (vs USDX)" accentColor="#F59E0B">
         <p style={pStyle}>XAUUSD (și, mai slab, alte active denominate în USD) se mișcă în mod normal invers față de USDX (indicele dolarului). Când USDX face un nou swing high dar instrumentul nu confirmă cu Lower-Low corespunzător (sau invers), corelația așteptată s-a rupt — semnal de epuizare a mișcării sau posibilă întoarcere.</p>
@@ -860,177 +850,6 @@ function StrategyTab({ params }) {
   );
 }
 
-const IMPACT_META = {
-  High: { color: "#F87171", label: "Impact mare" },
-  Medium: { color: "#FB923C", label: "Impact mediu" },
-  Low: { color: "#6B6F7B", label: "Impact mic" },
-  Holiday: { color: "#4F8DFD", label: "Sărbătoare" },
-};
-
-function dayKeyRo(iso) {
-  return new Date(iso).toLocaleDateString("en-CA", { timeZone: "Europe/Bucharest" });
-}
-
-function dayLabelRo(iso) {
-  const key = dayKeyRo(iso);
-  const todayKey = new Date().toLocaleDateString("en-CA", { timeZone: "Europe/Bucharest" });
-  const tomorrowKey = new Date(Date.now() + 86400000).toLocaleDateString("en-CA", { timeZone: "Europe/Bucharest" });
-  if (key === todayKey) return "Azi";
-  if (key === tomorrowKey) return "Mâine";
-  return new Date(iso).toLocaleDateString("ro-RO", { weekday: "long", day: "numeric", month: "long", timeZone: "Europe/Bucharest" });
-}
-
-function timeLabelRo(iso) {
-  return new Date(iso).toLocaleTimeString("ro-RO", { hour: "2-digit", minute: "2-digit", timeZone: "Europe/Bucharest", hour12: false });
-}
-
-function NewsEventRow({ event }) {
-  const meta = IMPACT_META[event.impact] || { color: "#6B6F7B", label: event.impact };
-  const isPast = new Date(event.date).getTime() < Date.now();
-  return (
-    <div style={{
-      display: "flex", alignItems: "flex-start", gap: 10, padding: "10px 0",
-      borderBottom: "1px solid #1A1C22", opacity: isPast ? 0.55 : 1,
-    }}>
-      <div style={{ width: 44, flexShrink: 0, fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, color: "#9A9DA8", paddingTop: 2 }}>
-        {timeLabelRo(event.date)}
-      </div>
-      <div style={{ width: 8, height: 8, borderRadius: "50%", background: meta.color, flexShrink: 0, marginTop: 5 }} title={meta.label} />
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 3, flexWrap: "wrap" }}>
-          <span style={{ fontSize: 10.5, fontWeight: 700, color: "#D4AF37", background: "rgba(212,175,55,0.1)", padding: "1px 6px", borderRadius: 4, letterSpacing: "0.03em" }}>
-            {event.country}
-          </span>
-          <span style={{ fontSize: 10, fontWeight: 700, color: meta.color, textTransform: "uppercase", letterSpacing: "0.03em" }}>
-            {meta.label}
-          </span>
-        </div>
-        <div style={{ fontSize: 13, color: "#E8E6E0" }}>{event.title}</div>
-      </div>
-      {(event.forecast || event.previous || event.actual) && (
-        <div style={{ flexShrink: 0, textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: "#9A9DA8", lineHeight: 1.6 }}>
-          {event.actual && <div>Act: <b style={{ color: "#E8E6E0" }}>{event.actual}</b></div>}
-          {event.forecast && <div>Fc: {event.forecast}</div>}
-          {event.previous && <div>Prev: {event.previous}</div>}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function NewsTab() {
-  const [events, setEvents] = useState([]);
-  const [status, setStatus] = useState("idle");
-  const [errorMsg, setErrorMsg] = useState(null);
-  const [lastUpdated, setLastUpdated] = useState(null);
-  const [currencyFilter, setCurrencyFilter] = useState("all");
-  const [impactFilter, setImpactFilter] = useState("all");
-
-  const fetchNews = useCallback(async () => {
-    setStatus("loading");
-    setErrorMsg(null);
-    try {
-      const res = await fetch("/api/forex-news");
-      const data = await res.json();
-      if (!res.ok || data.error) throw new Error(data.error || "Eroare la preluarea știrilor");
-      setEvents(data.events || []);
-      setStatus("ok");
-      setLastUpdated(new Date());
-    } catch (err) {
-      setStatus("error");
-      setErrorMsg(err.message || "Fetch eșuat");
-    }
-  }, []);
-
-  useEffect(() => { fetchNews(); }, [fetchNews]);
-
-  useEffect(() => {
-    const id = setInterval(() => fetchNews(), 5 * 60 * 1000); // auto-refresh la 5 minute
-    return () => clearInterval(id);
-  }, [fetchNews]);
-
-  const currencies = useMemo(() => {
-    const set = new Set(events.map((e) => e.country).filter(Boolean));
-    return ["all", ...Array.from(set).sort()];
-  }, [events]);
-
-  const filtered = useMemo(() => {
-    return events.filter((e) => {
-      if (currencyFilter !== "all" && e.country !== currencyFilter) return false;
-      if (impactFilter !== "all" && e.impact !== impactFilter) return false;
-      return true;
-    });
-  }, [events, currencyFilter, impactFilter]);
-
-  const grouped = useMemo(() => {
-    const map = new Map();
-    filtered.forEach((e) => {
-      const key = dayKeyRo(e.date);
-      if (!map.has(key)) map.set(key, []);
-      map.get(key).push(e);
-    });
-    return Array.from(map.entries()).sort((a, b) => (a[0] < b[0] ? -1 : 1));
-  }, [filtered]);
-
-  return (
-    <div>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 14, flexWrap: "wrap", gap: 10 }}>
-        <div>
-          <div style={{ fontSize: 14, fontWeight: 700, color: "#E8E6E0" }}>Calendar economic</div>
-          <div style={{ fontSize: 11.5, color: "#54575F", marginTop: 2 }}>Sursă: Forex Factory · ore afișate RO</div>
-        </div>
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: "#6B6F7B" }}>
-            {status === "loading" ? "Se actualizează..." : lastUpdated ? `Actualizat ${lastUpdated.toLocaleTimeString("ro-RO")}` : ""}
-          </span>
-          <button onClick={fetchNews} style={iconBtnStyle}><RefreshCw size={14} /></button>
-        </div>
-      </div>
-
-      {status === "error" && (
-        <div style={{ fontSize: 12, color: "#E0664A", background: "rgba(224,102,74,0.08)", border: "1px solid rgba(224,102,74,0.25)", borderRadius: 8, padding: "10px 14px", marginBottom: 16 }}>
-          {errorMsg}
-        </div>
-      )}
-
-      <div style={{ display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
-        {currencies.map((c) => (
-          <FilterChip key={c} label={c === "all" ? "Toate" : c} active={currencyFilter === c} onClick={() => setCurrencyFilter(c)} color="#D4AF37" />
-        ))}
-      </div>
-      <div style={{ display: "flex", gap: 6, marginBottom: 18, flexWrap: "wrap" }}>
-        <FilterChip label="Toate impacturile" active={impactFilter === "all"} onClick={() => setImpactFilter("all")} color="#9A9DA8" />
-        {Object.entries(IMPACT_META).map(([key, meta]) => (
-          <FilterChip key={key} label={meta.label} active={impactFilter === key} onClick={() => setImpactFilter(key)} color={meta.color} />
-        ))}
-      </div>
-
-      {status === "loading" && events.length === 0 && (
-        <div style={{ color: "#6B6F7B", fontSize: 13, padding: "20px 0", textAlign: "center" }}>Se încarcă...</div>
-      )}
-
-      {status === "ok" && filtered.length === 0 && (
-        <div style={{ color: "#54575F", fontSize: 13, padding: "20px 0", textAlign: "center" }}>Niciun eveniment pentru filtrul selectat.</div>
-      )}
-
-      {grouped.map(([key, dayEvents]) => (
-        <div key={key} style={{ marginBottom: 18 }}>
-          <div style={{ fontSize: 11.5, fontWeight: 700, color: "#9A9DA8", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6 }}>
-            {dayLabelRo(dayEvents[0].date)}
-          </div>
-          <div style={{ background: "#101218", border: "1px solid #1E2128", borderRadius: 8, padding: "2px 14px" }}>
-            {dayEvents.map((e, i) => <NewsEventRow key={i} event={e} />)}
-          </div>
-        </div>
-      ))}
-
-      <div style={{ fontSize: 11, color: "#54575F", textAlign: "center", marginTop: 4, lineHeight: 1.6 }}>
-        Date publice de pe forexfactory.com · actualizat automat la 5 minute.
-      </div>
-    </div>
-  );
-}
-
 export default function Home() {
   const [activeTab, setActiveTab] = useState("scanner");
   const [params, setParams] = useState(DEFAULT_PARAMS);
@@ -1055,7 +874,6 @@ export default function Home() {
         {activeTab === "backtest" && <BacktestTab params={params} />}
         {activeTab === "trades" && <MyTradesTab />}
         {activeTab === "strategy" && <StrategyTab params={params} />}
-        {activeTab === "news" && <NewsTab />}
         <div style={{ marginTop: 28, fontSize: 11, color: "#54575F", lineHeight: 1.6, textAlign: "center" }}>
           Educational personal dashboard — not financial advice.
         </div>
