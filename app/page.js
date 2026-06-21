@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { LineChart, Line, ResponsiveContainer, YAxis, Tooltip } from "recharts";
-import { Scan, History, Briefcase, BookOpen, RefreshCw, Settings2, Clock } from "lucide-react";
+import { Scan, History, Briefcase, BookOpen, RefreshCw, Settings2, Clock, Newspaper } from "lucide-react";
 import { DEFAULT_PARAMS } from "./lib/granBoxLogic";
 import { buildUnifiedSignals, STRATEGY_META } from "./lib/unifiedSignals";
 import { runBacktest, PIP_SIZE_BY_SYMBOL } from "./lib/backtestEngine";
@@ -36,6 +36,7 @@ const TABS = [
   { id: "backtest", label: "Backtest", icon: History },
   { id: "trades", label: "My Trades", icon: Briefcase },
   { id: "strategy", label: "Strategy", icon: BookOpen },
+  { id: "news", label: "Știri", icon: Newspaper },
 ];
 
 function TabBar({ active, onChange }) {
@@ -807,6 +808,177 @@ function StrategyTab({ params }) {
   );
 }
 
+const IMPACT_META = {
+  High: { color: "#F87171", label: "Impact mare" },
+  Medium: { color: "#FB923C", label: "Impact mediu" },
+  Low: { color: "#6B6F7B", label: "Impact mic" },
+  Holiday: { color: "#4F8DFD", label: "Sărbătoare" },
+};
+
+function dayKeyRo(iso) {
+  return new Date(iso).toLocaleDateString("en-CA", { timeZone: "Europe/Bucharest" });
+}
+
+function dayLabelRo(iso) {
+  const key = dayKeyRo(iso);
+  const todayKey = new Date().toLocaleDateString("en-CA", { timeZone: "Europe/Bucharest" });
+  const tomorrowKey = new Date(Date.now() + 86400000).toLocaleDateString("en-CA", { timeZone: "Europe/Bucharest" });
+  if (key === todayKey) return "Azi";
+  if (key === tomorrowKey) return "Mâine";
+  return new Date(iso).toLocaleDateString("ro-RO", { weekday: "long", day: "numeric", month: "long", timeZone: "Europe/Bucharest" });
+}
+
+function timeLabelRo(iso) {
+  return new Date(iso).toLocaleTimeString("ro-RO", { hour: "2-digit", minute: "2-digit", timeZone: "Europe/Bucharest", hour12: false });
+}
+
+function NewsEventRow({ event }) {
+  const meta = IMPACT_META[event.impact] || { color: "#6B6F7B", label: event.impact };
+  const isPast = new Date(event.date).getTime() < Date.now();
+  return (
+    <div style={{
+      display: "flex", alignItems: "flex-start", gap: 10, padding: "10px 0",
+      borderBottom: "1px solid #1A1C22", opacity: isPast ? 0.55 : 1,
+    }}>
+      <div style={{ width: 44, flexShrink: 0, fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, color: "#9A9DA8", paddingTop: 2 }}>
+        {timeLabelRo(event.date)}
+      </div>
+      <div style={{ width: 8, height: 8, borderRadius: "50%", background: meta.color, flexShrink: 0, marginTop: 5 }} title={meta.label} />
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 3, flexWrap: "wrap" }}>
+          <span style={{ fontSize: 10.5, fontWeight: 700, color: "#D4AF37", background: "rgba(212,175,55,0.1)", padding: "1px 6px", borderRadius: 4, letterSpacing: "0.03em" }}>
+            {event.country}
+          </span>
+          <span style={{ fontSize: 10, fontWeight: 700, color: meta.color, textTransform: "uppercase", letterSpacing: "0.03em" }}>
+            {meta.label}
+          </span>
+        </div>
+        <div style={{ fontSize: 13, color: "#E8E6E0" }}>{event.title}</div>
+      </div>
+      {(event.forecast || event.previous || event.actual) && (
+        <div style={{ flexShrink: 0, textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: "#9A9DA8", lineHeight: 1.6 }}>
+          {event.actual && <div>Act: <b style={{ color: "#E8E6E0" }}>{event.actual}</b></div>}
+          {event.forecast && <div>Fc: {event.forecast}</div>}
+          {event.previous && <div>Prev: {event.previous}</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function NewsTab() {
+  const [events, setEvents] = useState([]);
+  const [status, setStatus] = useState("idle");
+  const [errorMsg, setErrorMsg] = useState(null);
+  const [lastUpdated, setLastUpdated] = useState(null);
+  const [currencyFilter, setCurrencyFilter] = useState("all");
+  const [impactFilter, setImpactFilter] = useState("all");
+
+  const fetchNews = useCallback(async () => {
+    setStatus("loading");
+    setErrorMsg(null);
+    try {
+      const res = await fetch("/api/forex-news");
+      const data = await res.json();
+      if (!res.ok || data.error) throw new Error(data.error || "Eroare la preluarea știrilor");
+      setEvents(data.events || []);
+      setStatus("ok");
+      setLastUpdated(new Date());
+    } catch (err) {
+      setStatus("error");
+      setErrorMsg(err.message || "Fetch eșuat");
+    }
+  }, []);
+
+  useEffect(() => { fetchNews(); }, [fetchNews]);
+
+  useEffect(() => {
+    const id = setInterval(() => fetchNews(), 5 * 60 * 1000); // auto-refresh la 5 minute
+    return () => clearInterval(id);
+  }, [fetchNews]);
+
+  const currencies = useMemo(() => {
+    const set = new Set(events.map((e) => e.country).filter(Boolean));
+    return ["all", ...Array.from(set).sort()];
+  }, [events]);
+
+  const filtered = useMemo(() => {
+    return events.filter((e) => {
+      if (currencyFilter !== "all" && e.country !== currencyFilter) return false;
+      if (impactFilter !== "all" && e.impact !== impactFilter) return false;
+      return true;
+    });
+  }, [events, currencyFilter, impactFilter]);
+
+  const grouped = useMemo(() => {
+    const map = new Map();
+    filtered.forEach((e) => {
+      const key = dayKeyRo(e.date);
+      if (!map.has(key)) map.set(key, []);
+      map.get(key).push(e);
+    });
+    return Array.from(map.entries()).sort((a, b) => (a[0] < b[0] ? -1 : 1));
+  }, [filtered]);
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 14, flexWrap: "wrap", gap: 10 }}>
+        <div>
+          <div style={{ fontSize: 14, fontWeight: 700, color: "#E8E6E0" }}>Calendar economic</div>
+          <div style={{ fontSize: 11.5, color: "#54575F", marginTop: 2 }}>Sursă: Forex Factory · ore afișate RO</div>
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: "#6B6F7B" }}>
+            {status === "loading" ? "Se actualizează..." : lastUpdated ? `Actualizat ${lastUpdated.toLocaleTimeString("ro-RO")}` : ""}
+          </span>
+          <button onClick={fetchNews} style={iconBtnStyle}><RefreshCw size={14} /></button>
+        </div>
+      </div>
+
+      {status === "error" && (
+        <div style={{ fontSize: 12, color: "#E0664A", background: "rgba(224,102,74,0.08)", border: "1px solid rgba(224,102,74,0.25)", borderRadius: 8, padding: "10px 14px", marginBottom: 16 }}>
+          {errorMsg}
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
+        {currencies.map((c) => (
+          <FilterChip key={c} label={c === "all" ? "Toate" : c} active={currencyFilter === c} onClick={() => setCurrencyFilter(c)} color="#D4AF37" />
+        ))}
+      </div>
+      <div style={{ display: "flex", gap: 6, marginBottom: 18, flexWrap: "wrap" }}>
+        <FilterChip label="Toate impacturile" active={impactFilter === "all"} onClick={() => setImpactFilter("all")} color="#9A9DA8" />
+        {Object.entries(IMPACT_META).map(([key, meta]) => (
+          <FilterChip key={key} label={meta.label} active={impactFilter === key} onClick={() => setImpactFilter(key)} color={meta.color} />
+        ))}
+      </div>
+
+      {status === "loading" && events.length === 0 && (
+        <div style={{ color: "#6B6F7B", fontSize: 13, padding: "20px 0", textAlign: "center" }}>Se încarcă...</div>
+      )}
+
+      {status === "ok" && filtered.length === 0 && (
+        <div style={{ color: "#54575F", fontSize: 13, padding: "20px 0", textAlign: "center" }}>Niciun eveniment pentru filtrul selectat.</div>
+      )}
+
+      {grouped.map(([key, dayEvents]) => (
+        <div key={key} style={{ marginBottom: 18 }}>
+          <div style={{ fontSize: 11.5, fontWeight: 700, color: "#9A9DA8", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6 }}>
+            {dayLabelRo(dayEvents[0].date)}
+          </div>
+          <div style={{ background: "#101218", border: "1px solid #1E2128", borderRadius: 8, padding: "2px 14px" }}>
+            {dayEvents.map((e, i) => <NewsEventRow key={i} event={e} />)}
+          </div>
+        </div>
+      ))}
+
+      <div style={{ fontSize: 11, color: "#54575F", textAlign: "center", marginTop: 4, lineHeight: 1.6 }}>
+        Date publice de pe forexfactory.com · actualizat automat la 5 minute.
+      </div>
+    </div>
+  );
+}
+
 export default function Home() {
   const [activeTab, setActiveTab] = useState("scanner");
   const [params, setParams] = useState(DEFAULT_PARAMS);
@@ -831,6 +1003,7 @@ export default function Home() {
         {activeTab === "backtest" && <BacktestTab params={params} />}
         {activeTab === "trades" && <MyTradesTab />}
         {activeTab === "strategy" && <StrategyTab params={params} />}
+        {activeTab === "news" && <NewsTab />}
         <div style={{ marginTop: 28, fontSize: 11, color: "#54575F", lineHeight: 1.6, textAlign: "center" }}>
           Educational personal dashboard — not financial advice.
         </div>
