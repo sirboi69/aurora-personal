@@ -10,7 +10,9 @@ import { getCurrentWindowStatus, fmtHourRo } from "./lib/timeWindows";
 
 const INSTRUMENTS = {
   XAUUSD: { symbol: "XAU/USD", label: "Gold Spot", short: "XAUUSD", accent: "#D4AF37", accentDim: "rgba(212,175,55,0.14)", decimals: 2 },
-  SPX: { symbol: "SPX", label: "S&P 500", short: "S&P 500", accent: "#4F8DFD", accentDim: "rgba(79,141,253,0.14)", decimals: 2 },
+  // SPX (indicele brut) necesită plan plătit pe Twelve Data — folosim SPY (ETF-ul SPDR
+  // S&P 500), disponibil pe planul gratuit. Preț proporțional cu indicele (~1/10), nu identic.
+  SPX: { symbol: "SPY", label: "S&P 500 (proxy SPY ETF)", short: "S&P 500", accent: "#4F8DFD", accentDim: "rgba(79,141,253,0.14)", decimals: 2 },
 };
 
 function fmt(n, d = 2) {
