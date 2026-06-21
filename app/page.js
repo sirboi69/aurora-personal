@@ -10,11 +10,74 @@ import { getCurrentWindowStatus, fmtHourRo } from "./lib/timeWindows";
 
 const INSTRUMENTS = {
   XAUUSD: { symbol: "XAU/USD", label: "Gold Spot", short: "XAUUSD", accent: "#D4AF37", accentDim: "rgba(212,175,55,0.14)", decimals: 2 },
-  // SPX (indicele brut) necesită plan plătit pe Twelve Data — folosim SPY (ETF-ul SPDR
-  // S&P 500), disponibil pe planul gratuit. Preț proporțional cu indicele (~1/10), nu identic.
-  // Date reale de index S&P 500, via Yahoo Finance (vezi app/api/candles/route.js) — gratuit.
+  // Date reale de index S&P 500, via Yahoo Finance (vezi app/api/candles/route.js) — gratuit,
+  // nu consumă din bugetul de credite Twelve Data de mai jos.
   SPX: { symbol: "SPX", label: "S&P 500", short: "S&P 500", accent: "#4F8DFD", accentDim: "rgba(79,141,253,0.14)", decimals: 2 },
 };
+
+// === Buget adaptiv de credite Twelve Data ===================================
+// Fiecare refresh costă exact 1 credit Twelve Data (doar XAUUSD; S&P 500 vine
+// gratuit de la Yahoo, nu se numără aici). Plan gratuit: 8 credite/minut, 800/zi.
+// În loc de un interval fix, calculăm DINAMIC cel mai rapid interval de auto-refresh
+// care nu riscă niciodată să depășească limitele — mai des în ferestre active de
+// trading, mai rar în restul timpului — păstrând mereu o marjă pentru refresh manual.
+const CREDIT_LOG_KEY = "aurora_td_credits_v1";
+const MINUTE_MS = 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const PER_MINUTE_SAFE = 6; // din 8 reale — păstrăm 2 ca marjă pt. click-uri manuale
+const PER_DAY_SAFE = 760; // din 800 reale — păstrăm 40 ca marjă de siguranță
+
+function loadCreditLog() {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.localStorage.getItem(CREDIT_LOG_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    const cutoff = Date.now() - DAY_MS; // fereastră glisantă de 24h (variantă conservatoare,
+    return arr.filter((t) => typeof t === "number" && t > cutoff); // sigură indiferent de ora exactă a reset-ului Twelve Data
+  } catch {
+    return [];
+  }
+}
+
+function recordCredit() {
+  if (typeof window === "undefined") return;
+  const log = loadCreditLog();
+  log.push(Date.now());
+  try { window.localStorage.setItem(CREDIT_LOG_KEY, JSON.stringify(log)); } catch {}
+}
+
+function creditStats() {
+  const log = loadCreditLog();
+  const now = Date.now();
+  return {
+    usedThisMinute: log.filter((t) => now - t < MINUTE_MS).length,
+    usedToday: log.length,
+  };
+}
+
+// Cel mai rapid interval (ms) sigur până la următorul refresh automat.
+// Returnează null când bugetul zilnic e epuizat — semn să oprim auto-refresh-ul.
+function computeAdaptiveIntervalMs(isActiveWindow) {
+  const { usedThisMinute, usedToday } = creditStats();
+
+  if (usedToday >= PER_DAY_SAFE) return null;
+  if (usedThisMinute >= PER_MINUTE_SAFE) {
+    return MINUTE_MS - (Date.now() % MINUTE_MS) + 1000; // așteptăm să treacă minutul curent
+  }
+
+  const now = new Date();
+  const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 0);
+  const msUntilMidnight = midnight.getTime() - now.getTime();
+  const remainingBudget = Math.max(PER_DAY_SAFE - usedToday, 1);
+  const avgIntervalForRestOfDay = msUntilMidnight / remainingBudget;
+
+  // Fereastră activă: 3x mai des decât media necesară ca bugetul să acopere toată ziua;
+  // în afara ferestrei: 3x mai rar — economisim creditele pentru momentele care contează.
+  const target = isActiveWindow ? avgIntervalForRestOfDay / 3 : avgIntervalForRestOfDay * 3;
+  const minSafeInterval = MINUTE_MS / PER_MINUTE_SAFE; // niciodată mai des de-atât (10s)
+
+  return Math.max(target, minSafeInterval);
+}
 
 function fmt(n, d = 2) {
   if (n === null || n === undefined || Number.isNaN(n)) return "—";
@@ -296,7 +359,8 @@ function ScannerTab({ params, setParams }) {
   const [refreshCooldown, setRefreshCooldown] = useState(0);
   const cooldownIntervalRef = useRef(null);
   const [strategyFilter, setStrategyFilter] = useState("all");
-  const intervalRef = useRef(null);
+  const autoRefreshTimeoutRef = useRef(null);
+  const [budgetExhausted, setBudgetExhausted] = useState(false);
   const clockRef = useRef(null);
 
   useEffect(() => {
@@ -311,6 +375,7 @@ function ScannerTab({ params, setParams }) {
     try {
       // Only 1h candles needed now — Gran Box, Power 3, and Order Flow all run on this
       // single timeframe. One request per instrument keeps API credit usage minimal.
+      if (instrumentKey === "XAUUSD") recordCredit(); // singurul care consumă din bugetul Twelve Data — SPX e gratuit (Yahoo)
       const res1h = await fetch(`/api/candles?symbol=${encodeURIComponent(cfg.symbol)}&interval=1h&outputsize=150`);
       const ts = await res1h.json();
       if (!res1h.ok || ts.error) throw new Error(ts.error || "API error");
@@ -345,13 +410,15 @@ function ScannerTab({ params, setParams }) {
     setLastUpdated(new Date());
   }, [fetchInstrument]);
 
-  // Throttled wrapper: now only 2 Twelve Data requests per full refresh (1h × 2
-  // instruments — Gran Box, Power 3, and Order Flow all share that one timeframe).
-  // Cooldown kept as a safety margin against the free plan's per-minute credit cap.
-  const REFRESH_COOLDOWN_SECONDS = 15;
-
+  // Cooldown-ul manual reflectă acum bugetul REAL rămas (nu mai e un număr fix de 15s):
+  // dacă mai sunt credite disponibile în minutul curent, cooldown scurt (~10s, doar
+  // anti-dublu-click); dacă s-a atins marja sigură de 6/minut, așteaptă până trece minutul.
   const startCooldown = useCallback(() => {
-    setRefreshCooldown(REFRESH_COOLDOWN_SECONDS);
+    const { usedThisMinute } = creditStats();
+    const seconds = usedThisMinute >= PER_MINUTE_SAFE
+      ? Math.ceil((MINUTE_MS - (Date.now() % MINUTE_MS) + 1000) / 1000)
+      : Math.ceil(MINUTE_MS / PER_MINUTE_SAFE / 1000);
+    setRefreshCooldown(seconds);
     if (cooldownIntervalRef.current) clearInterval(cooldownIntervalRef.current);
     cooldownIntervalRef.current = setInterval(() => {
       setRefreshCooldown((c) => {
@@ -372,16 +439,48 @@ function ScannerTab({ params, setParams }) {
 
   useEffect(() => { refreshAll(); }, []); // initial load only
 
+  // Auto-refresh adaptiv: după fiecare ciclu, recalculează cel mai rapid interval
+  // sigur (ținând cont de buget + fereastra de trading activă) și se reprogramează
+  // singur — în loc de un setInterval fix care fie irosea credite degeaba (noaptea),
+  // fie nu profita de bugetul rămas (în ferestrele active, unde contează cel mai mult).
   useEffect(() => {
     if (!autoRefresh) {
-      if (intervalRef.current) clearInterval(intervalRef.current);
+      if (autoRefreshTimeoutRef.current) clearTimeout(autoRefreshTimeoutRef.current);
+      setBudgetExhausted(false);
       return;
     }
-    // Auto-refresh interval is intentionally longer than the cooldown so it never gets
-    // silently skipped by the throttle.
-    intervalRef.current = setInterval(() => refreshAll(), 90000);
-    return () => clearInterval(intervalRef.current);
-  }, [autoRefresh, refreshAll]);
+
+    let cancelled = false;
+    const scheduleNext = () => {
+      const isActive = !!(windowStatus && windowStatus.windows.some((w) => w.isActive));
+      const delay = computeAdaptiveIntervalMs(isActive);
+      if (delay == null) {
+        setBudgetExhausted(true); // buget zilnic epuizat — oprim auto-refresh, dar refresh manual tot merge
+        return;
+      }
+      setBudgetExhausted(false);
+      autoRefreshTimeoutRef.current = setTimeout(async () => {
+        if (cancelled) return;
+        await doRefresh();
+        if (!cancelled) scheduleNext();
+      }, delay);
+    };
+    scheduleNext();
+
+    return () => {
+      cancelled = true;
+      if (autoRefreshTimeoutRef.current) clearTimeout(autoRefreshTimeoutRef.current);
+    };
+  }, [autoRefresh, doRefresh, windowStatus]);
+
+  // Tick ușor (o dată la 5s) doar ca să reîmprospătăm afișajul "Credite azi: X/800" —
+  // localStorage nu e reactiv, deci altfel textul ar rămâne înghețat la prima citire.
+  const [, setBudgetTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setBudgetTick((t) => t + 1), 5000);
+    return () => clearInterval(id);
+  }, []);
+  const budgetStats = creditStats();
 
   const cfg = INSTRUMENTS[selectedInstrument];
   const d = data[selectedInstrument];
@@ -415,6 +514,19 @@ function ScannerTab({ params, setParams }) {
             {refreshCooldown > 0 && ` · refresh în ${refreshCooldown}s`}
           </span>
           <button
+            onClick={() => setAutoRefresh((a) => !a)}
+            style={{
+              ...iconBtnStyle,
+              padding: "7px 12px",
+              border: autoRefresh ? "1px solid #4ADE80" : iconBtnStyle.border,
+              color: autoRefresh ? "#4ADE80" : iconBtnStyle.color,
+              fontSize: 11.5, fontWeight: 600,
+            }}
+            title={autoRefresh ? "Auto-refresh: pornit (click ca să oprești)" : "Auto-refresh: oprit (click ca să pornești)"}
+          >
+            {autoRefresh ? "● Auto" : "○ Auto"}
+          </button>
+          <button
             onClick={refreshAll}
             disabled={refreshCooldown > 0}
             style={{ ...iconBtnStyle, opacity: refreshCooldown > 0 ? 0.4 : 1, cursor: refreshCooldown > 0 ? "not-allowed" : "pointer" }}
@@ -428,7 +540,7 @@ function ScannerTab({ params, setParams }) {
 
       {windowStatus && (
         <div style={{
-          display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", borderRadius: 8, marginBottom: 18,
+          display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", borderRadius: 8, marginBottom: 10,
           background: activeWindows.length ? "rgba(74,222,128,0.08)" : "rgba(255,255,255,0.03)",
           border: `1px solid ${activeWindows.length ? "rgba(74,222,128,0.3)" : "#1E2128"}`,
         }}>
@@ -440,6 +552,23 @@ function ScannerTab({ params, setParams }) {
           </div>
         </div>
       )}
+
+      <div style={{
+        display: "flex", alignItems: "center", gap: 10, padding: "8px 14px", borderRadius: 8, marginBottom: 18,
+        background: budgetExhausted ? "rgba(224,102,74,0.08)" : "rgba(255,255,255,0.02)",
+        border: `1px solid ${budgetExhausted ? "rgba(224,102,74,0.3)" : "#1E2128"}`,
+        fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: budgetExhausted ? "#E0664A" : "#54575F",
+      }}>
+        <span>Credite Twelve Data azi: <b style={{ color: budgetExhausted ? "#E0664A" : "#9A9DA8" }}>{budgetStats.usedToday}/800</b></span>
+        <span>·</span>
+        <span>minutul curent: {budgetStats.usedThisMinute}/8</span>
+        {autoRefresh && (
+          <>
+            <span>·</span>
+            <span>{budgetExhausted ? "buget epuizat azi — auto-refresh oprit (refresh manual tot merge)" : "auto-refresh activ, interval adaptiv"}</span>
+          </>
+        )}
+      </div>
 
       {showSettings && <ParamsPanel params={params} setParams={setParams} />}
 
