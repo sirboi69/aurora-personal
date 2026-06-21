@@ -11,7 +11,6 @@ import { detectPower3Setups } from "./power3Logic";
 import { getOrderFlowSnapshot } from "./orderFlowLogic";
 import { detectLiquidityPools, isNearLiquidity } from "./liquidityLogic";
 import { detectOrbSetup, evaluateOrbSetups } from "./orbLogic";
-import { getMostRecentChoCh } from "./chochLogic";
 import { detectUsdxDivergence } from "./usdxDivergenceLogic";
 
 export const STRATEGY_META = {
@@ -22,7 +21,6 @@ export const STRATEGY_META = {
   power3: { label: "Power 3", color: "#34D399" },
   orderflow: { label: "Order Flow", color: "#F472B6" },
   orb: { label: "ORB", color: "#22D3EE" },
-  choch: { label: "ChoCh", color: "#C084FC" },
   usdxdivergence: { label: "USDX Divergence", color: "#F59E0B" },
 };
 
@@ -124,20 +122,6 @@ export function buildUnifiedSignals(candles, htfCandles = [], granBoxParams = {}
     }
   }
 
-  // --- ChoCh (1h, most recent structure flip) ---
-  let chochSignals = [];
-  const recentChoCh = getMostRecentChoCh(candles);
-  if (recentChoCh) {
-    chochSignals = [{
-      strategy: "choch",
-      direction: recentChoCh.direction,
-      time: recentChoCh.time,
-      entry: recentChoCh.newPrice,
-      detail: recentChoCh.detail,
-      raw: recentChoCh,
-    }];
-  }
-
   // --- USDX Divergence (1h, requires aligned USDX candles) ---
   let usdxDivergenceSignals = [];
   if (usdxCandles && usdxCandles.length >= 20) {
@@ -152,7 +136,7 @@ export function buildUnifiedSignals(candles, htfCandles = [], granBoxParams = {}
     }));
   }
 
-  allSignals = allSignals.concat(granBoxes, fvgs, orderBlocks, power3Setups, orderFlowSignals, orbSignals, chochSignals, usdxDivergenceSignals);
+  allSignals = allSignals.concat(granBoxes, fvgs, orderBlocks, power3Setups, orderFlowSignals, orbSignals, usdxDivergenceSignals);
 
   allSignals = allSignals.map((s) => ({
     ...s,
