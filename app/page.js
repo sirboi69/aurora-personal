@@ -305,13 +305,34 @@ function AnalysisBlock({ text, accent }) {
   );
 }
 
+// Cache la nivel de modul (NU resetat la schimbarea de tab, doar la reload de pagină).
+// Twelve Data free plan permite doar 8 credite/minut — fără cache-ul ăsta, fiecare
+// switch între tab-uri remonta ScannerTab și declanșa un refetch complet (7 cereri).
+const scannerCache = {
+  data: { XAUUSD: null, SPX: null },
+  signals: { XAUUSD: [], SPX: [] },
+  candleHistory: { XAUUSD: [], SPX: [] },
+  raw: { XAUUSD: null, SPX: null }, // { candles, htfCandles, candles5m } — pentru recalcul local la schimbarea parametrilor
+  usdxCandles: [],
+  fetchedAt: { XAUUSD: 0, SPX: 0, DXY: 0 },
+};
+const AUTO_REFRESH_MS = 5 * 60 * 1000; // 5 minute (era 1 minut — prea des pentru planul gratuit)
+const STALE_AFTER_MS = 90 * 1000; // date sub 90s vechime nu se mai re-cer (ex. la revenire pe tab)
+
 function ScannerTab({ params, setParams }) {
-  const [data, setData] = useState({ XAUUSD: null, SPX: null });
-  const [signals, setSignals] = useState({ XAUUSD: [], SPX: [] });
-  const [candleHistory, setCandleHistory] = useState({ XAUUSD: [], SPX: [] });
-  const [status, setStatus] = useState({ XAUUSD: "idle", SPX: "idle" });
+  const [data, setData] = useState(scannerCache.data);
+  const [signals, setSignals] = useState(scannerCache.signals);
+  const [candleHistory, setCandleHistory] = useState(scannerCache.candleHistory);
+  const [status, setStatus] = useState({
+    XAUUSD: scannerCache.data.XAUUSD ? "ok" : "idle",
+    SPX: scannerCache.data.SPX ? "ok" : "idle",
+  });
   const [errorMsg, setErrorMsg] = useState({ XAUUSD: null, SPX: null });
-  const [lastUpdated, setLastUpdated] = useState(null);
+  const [lastUpdated, setLastUpdated] = useState(
+    Math.max(scannerCache.fetchedAt.XAUUSD, scannerCache.fetchedAt.SPX) > 0
+      ? new Date(Math.max(scannerCache.fetchedAt.XAUUSD, scannerCache.fetchedAt.SPX))
+      : null
+  );
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [selectedInstrument, setSelectedInstrument] = useState("XAUUSD");
   const [showSettings, setShowSettings] = useState(false);
@@ -363,6 +384,12 @@ function ScannerTab({ params, setParams }) {
 
       const unified = buildUnifiedSignals(candles, htfCandles, params, candles5m, usdxCandles || []);
 
+      scannerCache.signals[instrumentKey] = unified;
+      scannerCache.candleHistory[instrumentKey] = candles;
+      scannerCache.raw[instrumentKey] = { candles, htfCandles, candles5m };
+      scannerCache.data[instrumentKey] = { price: latest, change, changePct, sparkline };
+      scannerCache.fetchedAt[instrumentKey] = Date.now();
+
       setSignals((s) => ({ ...s, [instrumentKey]: unified }));
       setCandleHistory((h) => ({ ...h, [instrumentKey]: candles }));
       setData((d) => ({ ...d, [instrumentKey]: { price: latest, change, changePct, sparkline } }));
@@ -374,25 +401,50 @@ function ScannerTab({ params, setParams }) {
     }
   }, [params]);
 
-  const refreshAll = useCallback(async () => {
-    // Fetch USDX (DXY) once and share it across both instruments for divergence comparison
-    let usdxCandles = [];
-    try {
-      const resDxy = await fetch(`/api/candles?symbol=DXY&interval=1h&outputsize=200`);
-      const tsDxy = await resDxy.json();
-      if (resDxy.ok && tsDxy.values && tsDxy.values.length) {
-        usdxCandles = tsDxy.values
-          .map((v) => ({ time: v.datetime, open: parseFloat(v.open), high: parseFloat(v.high), low: parseFloat(v.low), close: parseFloat(v.close) }))
-          .reverse();
+  // refreshAll acum cere DOAR instrumentele indicate (implicit doar cel activ, nu ambele),
+  // și sare peste cele cu date mai noi de STALE_AFTER_MS — evită cererile duble la
+  // schimbarea rapidă între tab-uri (Scanner -> Știri -> Scanner etc.)
+  const refreshAll = useCallback(async (instrumentKeys, force = false) => {
+    const keys = instrumentKeys || [selectedInstrument];
+    const now = Date.now();
+    const needsFetch = keys.filter((k) => force || now - (scannerCache.fetchedAt[k] || 0) > STALE_AFTER_MS);
+    if (needsFetch.length === 0) return;
+
+    let usdxCandles = scannerCache.usdxCandles;
+    if (force || now - scannerCache.fetchedAt.DXY > STALE_AFTER_MS) {
+      try {
+        const resDxy = await fetch(`/api/candles?symbol=DXY&interval=1h&outputsize=200`);
+        const tsDxy = await resDxy.json();
+        if (resDxy.ok && tsDxy.values && tsDxy.values.length) {
+          usdxCandles = tsDxy.values
+            .map((v) => ({ time: v.datetime, open: parseFloat(v.open), high: parseFloat(v.high), low: parseFloat(v.low), close: parseFloat(v.close) }))
+            .reverse();
+          scannerCache.usdxCandles = usdxCandles;
+          scannerCache.fetchedAt.DXY = Date.now();
+        }
+      } catch (e) {
+        // USDX fetch failing shouldn't block the rest of the scanner — divergence signals just won't appear
       }
-    } catch (e) {
-      // USDX fetch failing shouldn't block the rest of the scanner — divergence signals just won't appear
     }
 
-    await Promise.all([fetchInstrument("XAUUSD", usdxCandles), fetchInstrument("SPX", usdxCandles)]);
+    await Promise.all(needsFetch.map((k) => fetchInstrument(k, usdxCandles)));
     setLastUpdated(new Date());
-  }, [fetchInstrument]);
+  }, [fetchInstrument, selectedInstrument]);
 
+  // La schimbarea parametrilor strategiei: recalculează semnalele DOAR din candle-urile
+  // deja descărcate (zero cereri API) — important acum că refreshAll sare peste cererile
+  // "prea recente", ca recalcularea să nu rămână blocată de gate-ul de staleness.
+  useEffect(() => {
+    Object.entries(scannerCache.raw).forEach(([key, raw]) => {
+      if (!raw) return;
+      const unified = buildUnifiedSignals(raw.candles, raw.htfCandles, params, raw.candles5m, scannerCache.usdxCandles);
+      scannerCache.signals[key] = unified;
+      setSignals((s) => ({ ...s, [key]: unified }));
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [params]);
+
+  // La montare: cere doar instrumentul activ (lazy — celălalt se cere când e selectat)
   useEffect(() => { refreshAll(); }, [refreshAll]);
 
   useEffect(() => {
@@ -400,9 +452,9 @@ function ScannerTab({ params, setParams }) {
       if (intervalRef.current) clearInterval(intervalRef.current);
       return;
     }
-    intervalRef.current = setInterval(() => refreshAll(), 60000);
+    intervalRef.current = setInterval(() => refreshAll([selectedInstrument], true), AUTO_REFRESH_MS);
     return () => clearInterval(intervalRef.current);
-  }, [autoRefresh, refreshAll]);
+  }, [autoRefresh, refreshAll, selectedInstrument]);
 
   const cfg = INSTRUMENTS[selectedInstrument];
   const d = data[selectedInstrument];
@@ -419,7 +471,7 @@ function ScannerTab({ params, setParams }) {
             const c = INSTRUMENTS[key];
             const isSel = selectedInstrument === key;
             return (
-              <button key={key} onClick={() => setSelectedInstrument(key)} style={{
+              <button key={key} onClick={() => { setSelectedInstrument(key); refreshAll([key]); }} style={{
                 background: isSel ? c.accentDim : "transparent",
                 border: `1px solid ${isSel ? c.accent : "#2A2D35"}`,
                 color: isSel ? c.accent : "#9A9DA8",
@@ -434,7 +486,7 @@ function ScannerTab({ params, setParams }) {
           <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: "#6B6F7B" }}>
             {lastUpdated ? `Updated ${lastUpdated.toLocaleTimeString()}` : "Fetching..."}
           </span>
-          <button onClick={refreshAll} style={iconBtnStyle}><RefreshCw size={14} /></button>
+          <button onClick={() => refreshAll([selectedInstrument], true)} style={iconBtnStyle}><RefreshCw size={14} /></button>
           <button onClick={() => setShowSettings((s) => !s)} style={iconBtnStyle}><Settings2 size={14} /></button>
         </div>
       </div>
