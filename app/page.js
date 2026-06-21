@@ -115,21 +115,6 @@ function describeSignalForPrompt(signal) {
 Zonă body: ${r.zoneLow} - ${r.zoneHigh}
 Sweep/penetrare în candle-ul anterior: ${(r.penetration * 100).toFixed(0)}%
 Box testat deja: ${r.tested ? "da" : "nu"}`;
-    case "fvg":
-      return `Strategia "Fair Value Gap" (ICT): un gap de imbalance pe 3 candle-uri consecutive, unde candle 1 nu se suprapune cu candle 3. Prețul tinde să revină și să reacționeze la umplerea gap-ului.
-Zonă gap: ${r.zoneLow} - ${r.zoneHigh}
-Gap umplut deja: ${r.filled ? "da" : "nu"}`;
-    case "orderblock":
-      return `Strategia "Order Block" (ICT clasic, checklist 7 puncte): ultimul candle opus culorii înainte de un impuls puternic care a spart structura.
-Zonă body: ${r.zoneLow} - ${r.zoneHigh}
-Reguli valide: ${r.passCount}/7
-Checklist detaliat: ${JSON.stringify(r.checklist)}`;
-    case "rejectionblock":
-      return `Strategia "Rejection Block": pe timeframe mare (4h), un candle cu body foarte mic (open≈close) și fitile mari arată o respingere puternică. Nivelul (open≈close) e proiectat în timp ca linie de reacție viitoare.
-Nivel: ${r.level}
-Body/range ratio: ${(r.bodyRatio * 100).toFixed(0)}%
-Candle high/low: ${r.candleHigh} / ${r.candleLow}
-Reacționat deja: ${r.reacted ? "da" : "nu"}`;
     case "power3":
       return `Strategia "Power 3" (ICT): Accumulation (range Asia) → Manipulation (fals breakout, de obicei London) → Distribution/Expansion (mișcarea reală, de obicei NY).
 Asia range: ${r.asiaLow} - ${r.asiaHigh}
@@ -141,19 +126,6 @@ Expansion: ${r.expansion ? `${r.expansion.active ? "activă" : "în așteptare"}
 Bias structură: ${r.structureBias}
 Candle-uri consecutive în aceeași direcție: ${r.consecutiveCount}
 Accelerare momentum: ${r.accelerating ? "da" : "nu"}`;
-    case "orb":
-      return `Strategia "ORB" (Opening Range Breakout, varianta Value Area): pe primele 3 candle-uri de 5m ale sesiunii (9:30-9:45 NY) se calculează o Value Area aproximată (VAH/VAL/POC) — NOTĂ: aproximare din OHLC, nu Volume Profile real cu tick data.
-Setup: ${r.setupType === "fakeout" ? "FAKEOUT (reversal) — prețul a spart range-ul, a luat lichiditate, apoi a revenit în Value Area" : "BREAKOUT (continuare) — închidere clară în afara Value Area"}
-VAH: ${r.valueArea?.vah?.toFixed(2)} · VAL: ${r.valueArea?.val?.toFixed(2)} · POC: ${r.valueArea?.poc?.toFixed(2)}
-Entry: ${r.entry?.toFixed(2)} · SL sugerat de logică: ${r.sl?.toFixed(2)} · TP sugerat de logică: ${r.tp?.toFixed(2)}`;
-    case "choch":
-      return `Strategia "ChoCh" (Change of Character): schimbare de structură de piață, diferită de BOS (care confirmă continuarea trendului). ChoCh marchează momentul exact când o secvență bullish (Higher-High/Higher-Low) se rupe într-un Lower-Low, sau o secvență bearish (Lower-High/Lower-Low) se rupe într-un Higher-High — primul semn obiectiv de potențială întoarcere de trend.
-${r.detail}
-Nivel rupt: ${r.brokenLevel?.toFixed(2)} · Noul preț: ${r.newPrice?.toFixed(2)}`;
-    case "usdxdivergence":
-      return `Strategia "Smart Money Divergence vs USDX": XAUUSD/instrumentul și USDX (indicele dolarului) se mișcă normal invers (corelație negativă). Când USDX face un nou swing high/low dar instrumentul NU confirmă cu mișcarea inversă așteptată, relația normală s-a rupt — semnal de epuizare sau întoarcere posibilă.
-${r.detail}
-Nivel USDX: ${r.usdxLevel?.toFixed(2)} · Nivel instrument: ${r.instrumentLevel?.toFixed(2)}`;
     default:
       return "";
   }
@@ -330,32 +302,19 @@ function ScannerTab({ params, setParams }) {
     return () => clearInterval(clockRef.current);
   }, []);
 
-  const fetchInstrument = useCallback(async (instrumentKey, usdxCandles) => {
+  const fetchInstrument = useCallback(async (instrumentKey) => {
     const cfg = INSTRUMENTS[instrumentKey];
     setStatus((s) => ({ ...s, [instrumentKey]: "loading" }));
     try {
-      // 1h candles for most strategies, 4h for Rejection Block, 5m (today) for ORB
-      const [res1h, res4h, res5m] = await Promise.all([
-        fetch(`/api/candles?symbol=${encodeURIComponent(cfg.symbol)}&interval=1h&outputsize=100`),
-        fetch(`/api/candles?symbol=${encodeURIComponent(cfg.symbol)}&interval=4h&outputsize=60`),
-        fetch(`/api/candles?symbol=${encodeURIComponent(cfg.symbol)}&interval=5min&outputsize=60`),
-      ]);
+      // Only 1h candles needed now — Gran Box, Power 3, and Order Flow all run on this
+      // single timeframe. One request per instrument keeps API credit usage minimal.
+      const res1h = await fetch(`/api/candles?symbol=${encodeURIComponent(cfg.symbol)}&interval=1h&outputsize=150`);
       const ts = await res1h.json();
-      const ts4h = await res4h.json();
-      const ts5m = await res5m.json();
       if (!res1h.ok || ts.error) throw new Error(ts.error || "API error");
       if (!ts.values || !ts.values.length) throw new Error("No data returned");
 
       const candles = ts.values
         .map((v) => ({ time: v.datetime, open: parseFloat(v.open), high: parseFloat(v.high), low: parseFloat(v.low), close: parseFloat(v.close) }))
-        .reverse();
-
-      const htfCandles = (ts4h.values || [])
-        .map((v) => ({ time: v.datetime, open: parseFloat(v.open), high: parseFloat(v.high), low: parseFloat(v.low), close: parseFloat(v.close) }))
-        .reverse();
-
-      const candles5m = (ts5m.values || [])
-        .map((v) => ({ time: v.datetime, open: parseFloat(v.open), high: parseFloat(v.high), low: parseFloat(v.low), close: parseFloat(v.close), volume: v.volume ? parseFloat(v.volume) : 0 }))
         .reverse();
 
       const closes = candles.map((c) => c.close);
@@ -365,7 +324,7 @@ function ScannerTab({ params, setParams }) {
       const changePct = (change / prevClose) * 100;
       const sparkline = closes.slice(-40).map((c, i) => ({ i, v: c }));
 
-      const unified = buildUnifiedSignals(candles, htfCandles, params, candles5m, usdxCandles || []);
+      const unified = buildUnifiedSignals(candles, params);
 
       setSignals((s) => ({ ...s, [instrumentKey]: unified }));
       setCandleHistory((h) => ({ ...h, [instrumentKey]: candles }));
@@ -379,29 +338,14 @@ function ScannerTab({ params, setParams }) {
   }, [params]);
 
   const doRefresh = useCallback(async () => {
-    // Fetch USDX (DXY) once and share it across both instruments for divergence comparison
-    let usdxCandles = [];
-    try {
-      const resDxy = await fetch(`/api/candles?symbol=DXY&interval=1h&outputsize=100`);
-      const tsDxy = await resDxy.json();
-      if (resDxy.ok && tsDxy.values && tsDxy.values.length) {
-        usdxCandles = tsDxy.values
-          .map((v) => ({ time: v.datetime, open: parseFloat(v.open), high: parseFloat(v.high), low: parseFloat(v.low), close: parseFloat(v.close) }))
-          .reverse();
-      }
-    } catch (e) {
-      // USDX fetch failing shouldn't block the rest of the scanner — divergence signals just won't appear
-    }
-
-    await Promise.all([fetchInstrument("XAUUSD", usdxCandles), fetchInstrument("SPX", usdxCandles)]);
+    await Promise.all([fetchInstrument("XAUUSD"), fetchInstrument("SPX")]);
     setLastUpdated(new Date());
   }, [fetchInstrument]);
 
-  // Throttled wrapper: this app fires up to 7 Twelve Data requests per full refresh
-  // (1h+4h+5min × 2 instruments + 1 shared DXY). The free plan caps at ~8 credits/minute,
-  // so refreshes are throttled to one every REFRESH_COOLDOWN_SECONDS to avoid hitting the
-  // rate limit, regardless of how often the user clicks Refresh or toggles auto-refresh.
-  const REFRESH_COOLDOWN_SECONDS = 25;
+  // Throttled wrapper: now only 2 Twelve Data requests per full refresh (1h × 2
+  // instruments — Gran Box, Power 3, and Order Flow all share that one timeframe).
+  // Cooldown kept as a safety margin against the free plan's per-minute credit cap.
+  const REFRESH_COOLDOWN_SECONDS = 15;
 
   const startCooldown = useCallback(() => {
     setRefreshCooldown(REFRESH_COOLDOWN_SECONDS);
@@ -783,18 +727,6 @@ function StrategyTab({ params }) {
         <p style={pStyle}>Box valid doar dacă displacement-ul penetrează ≥<b>{(params.sweepMinPenetration * 100).toFixed(0)}%</b> din candle-ul anterior.</p>
       </SectionCard>
 
-      <SectionCard title="Fair Value Gap (FVG)" accentColor="#4F8DFD">
-        <p style={pStyle}>Definiția ICT clasică: pe 3 candle-uri consecutive, dacă high-ul primului candle nu se suprapune cu low-ul celui de-al treilea (mișcare bullish), sau invers (bearish), zona dintre ele e un <b>imbalance</b>. Așteptăm ca prețul să revină și să reacționeze la umplerea gap-ului.</p>
-      </SectionCard>
-
-      <SectionCard title="Order Block" accentColor="#A78BFA">
-        <p style={pStyle}>Ultimul candle opus culorii înainte de un impuls puternic care sparge structura. Validat doar dacă trece toate cele <b>7 condiții</b>: fresh, impulsiv, sweep lichiditate anterioară, prim candle puternic, Break of Structure, origine zonă supply/demand, piață ne-ranging.</p>
-      </SectionCard>
-
-      <SectionCard title="Rejection Block" accentColor="#FB923C">
-        <p style={pStyle}>Pe timeframe mare (4h), un candle unde open-ul și close-ul sunt aproape identice (corp mic, fitile mari) arată o respingere puternică. Acel nivel exact (open≈close) e proiectat în timp ca linie de reacție pentru candle-urile viitoare — pozitiv (reacție în sus) sau negativ (reacție în jos).</p>
-      </SectionCard>
-
       <SectionCard title="Power 3 (ICT)" accentColor="#34D399">
         <p style={pStyle}>Modelul clasic de sesiune: <b>Accumulation</b> (range-ul sesiunii Asia) → <b>Manipulation</b> (London ia lichiditate de pe o parte a range-ului, fals breakout) → <b>Distribution/Expansion</b> (mișcarea reală, de obicei în sesiunea New York, în direcția opusă manipulării).</p>
       </SectionCard>
@@ -803,27 +735,8 @@ function StrategyTab({ params }) {
         <p style={pStyle}>Fără date reale de volum/bid-ask, aproximăm: structură de piață din swing highs/lows (Higher-High + Higher-Low = bullish; Lower-High + Lower-Low = bearish) combinată cu momentum din mărimea și direcția candle-urilor consecutive.</p>
       </SectionCard>
 
-      <SectionCard title="ORB — Opening Range Breakout (Value Area)" accentColor="#22D3EE">
-        <p style={pStyle}>Opening Range marcat pe primele 3 candle-uri de 5m (09:30–09:45 NY). În loc de simplul high/low, se calculează o <b>Value Area aproximată</b> (VAH/VAL/POC) — zona unde s-ar fi tranzacționat ~70% din volum.</p>
-        <p style={pStyle}><b>Notă:</b> Twelve Data nu oferă volum real pe niveluri de preț (tick data), deci VAH/VAL/POC sunt o aproximare calculată din OHLC (body ponderat mai greu decât fitilele), nu Volume Profile exact.</p>
-        <RuleRow label="Fakeout (reversal)" value="Spargere range → atinge lichiditate → închidere 5m înapoi în VA → intrare inversă" />
-        <RuleRow label="Fakeout SL" value="Peste/sub lumânarea de confirmare" />
-        <RuleRow label="Fakeout TP" value="Partea opusă a range-ului / următoarea lichiditate" />
-        <RuleRow label="Breakout (continuare)" value="Trend clar sau sweep anterior + închidere 5m în afara VA" />
-        <RuleRow label="Breakout SL" value="2 ticks peste/sub POC" />
-        <RuleRow label="Breakout TP" value="2R fix" />
-      </SectionCard>
-
-      <SectionCard title="ChoCh — Change of Character" accentColor="#C084FC">
-        <p style={pStyle}>Diferit de BOS (care confirmă <b>continuarea</b> trendului), ChoCh marchează momentul exact când structura de piață se <b>schimbă</b>: o secvență bullish (Higher-High + Higher-Low) se rupe într-un Lower-Low, sau o secvență bearish (Lower-High + Lower-Low) se rupe într-un Higher-High. E primul semn obiectiv de potențială întoarcere de trend.</p>
-      </SectionCard>
-
-      <SectionCard title="Smart Money Divergence (vs USDX)" accentColor="#F59E0B">
-        <p style={pStyle}>XAUUSD (și, mai slab, alte active denominate în USD) se mișcă în mod normal invers față de USDX (indicele dolarului). Când USDX face un nou swing high dar instrumentul nu confirmă cu Lower-Low corespunzător (sau invers), corelația așteptată s-a rupt — semnal de epuizare a mișcării sau posibilă întoarcere.</p>
-      </SectionCard>
-
       <SectionCard title="Lichiditate — peste toate" accentColor="#EAB308">
-        <p style={pStyle}>Swing highs/lows nelichidate (neatinse încă de preț) sunt tratate ca zone prioritare — acolo stau probabil stop-loss-urile altora. Orice semnal (Gran Box, FVG, Order Block, Rejection Block) care se află aproape de o astfel de zonă e marcat ca <b>lângă lichiditate</b>, semn de confluență mai puternică.</p>
+        <p style={pStyle}>Swing highs/lows nelichidate (neatinse încă de preț) sunt tratate ca zone prioritare — acolo stau probabil stop-loss-urile altora. Orice semnal (Gran Box, Power 3) care se află aproape de o astfel de zonă e marcat ca <b>lângă lichiditate</b>, semn de confluență mai puternică.</p>
       </SectionCard>
 
       <SectionCard title="Fereastra de timp" accentColor="#A78BFA">
