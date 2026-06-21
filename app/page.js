@@ -146,10 +146,7 @@ Accelerare momentum: ${r.accelerating ? "da" : "nu"}`;
 Setup: ${r.setupType === "fakeout" ? "FAKEOUT (reversal) — prețul a spart range-ul, a luat lichiditate, apoi a revenit în Value Area" : "BREAKOUT (continuare) — închidere clară în afara Value Area"}
 VAH: ${r.valueArea?.vah?.toFixed(2)} · VAL: ${r.valueArea?.val?.toFixed(2)} · POC: ${r.valueArea?.poc?.toFixed(2)}
 Entry: ${r.entry?.toFixed(2)} · SL sugerat de logică: ${r.sl?.toFixed(2)} · TP sugerat de logică: ${r.tp?.toFixed(2)}`;
-    case "choch":
-      return `Strategia "ChoCh" (Change of Character): schimbare de structură de piață, diferită de BOS (care confirmă continuarea trendului). ChoCh marchează momentul exact când o secvență bullish (Higher-High/Higher-Low) se rupe într-un Lower-Low, sau o secvență bearish (Lower-High/Lower-Low) se rupe într-un Higher-High — primul semn obiectiv de potențială întoarcere de trend.
-${r.detail}
-Nivel rupt: ${r.brokenLevel?.toFixed(2)} · Noul preț: ${r.newPrice?.toFixed(2)}`;
+  
     case "usdxdivergence":
       return `Strategia "Smart Money Divergence vs USDX": XAUUSD/instrumentul și USDX (indicele dolarului) se mișcă normal invers (corelație negativă). Când USDX face un nou swing high/low dar instrumentul NU confirmă cu mișcarea inversă așteptată, relația normală s-a rupt — semnal de epuizare sau întoarcere posibilă.
 ${r.detail}
@@ -776,9 +773,7 @@ function StrategyTab({ params }) {
         <RuleRow label="Breakout TP" value="2R fix" />
       </SectionCard>
 
-      <SectionCard title="ChoCh — Change of Character" accentColor="#C084FC">
-        <p style={pStyle}>Diferit de BOS (care confirmă <b>continuarea</b> trendului), ChoCh marchează momentul exact când structura de piață se <b>schimbă</b>: o secvență bullish (Higher-High + Higher-Low) se rupe într-un Lower-Low, sau o secvență bearish (Lower-High + Lower-Low) se rupe într-un Higher-High. E primul semn obiectiv de potențială întoarcere de trend.</p>
-      </SectionCard>
+   
 
       <SectionCard title="Smart Money Divergence (vs USDX)" accentColor="#F59E0B">
         <p style={pStyle}>XAUUSD (și, mai slab, alte active denominate în USD) se mișcă în mod normal invers față de USDX (indicele dolarului). Când USDX face un nou swing high dar instrumentul nu confirmă cu Lower-Low corespunzător (sau invers), corelația așteptată s-a rupt — semnal de epuizare a mișcării sau posibilă întoarcere.</p>
