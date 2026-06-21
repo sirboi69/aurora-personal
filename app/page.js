@@ -146,6 +146,14 @@ Accelerare momentum: ${r.accelerating ? "da" : "nu"}`;
 Setup: ${r.setupType === "fakeout" ? "FAKEOUT (reversal) — prețul a spart range-ul, a luat lichiditate, apoi a revenit în Value Area" : "BREAKOUT (continuare) — închidere clară în afara Value Area"}
 VAH: ${r.valueArea?.vah?.toFixed(2)} · VAL: ${r.valueArea?.val?.toFixed(2)} · POC: ${r.valueArea?.poc?.toFixed(2)}
 Entry: ${r.entry?.toFixed(2)} · SL sugerat de logică: ${r.sl?.toFixed(2)} · TP sugerat de logică: ${r.tp?.toFixed(2)}`;
+    case "choch":
+      return `Strategia "ChoCh" (Change of Character): schimbare de structură de piață, diferită de BOS (care confirmă continuarea trendului). ChoCh marchează momentul exact când o secvență bullish (Higher-High/Higher-Low) se rupe într-un Lower-Low, sau o secvență bearish (Lower-High/Lower-Low) se rupe într-un Higher-High — primul semn obiectiv de potențială întoarcere de trend.
+${r.detail}
+Nivel rupt: ${r.brokenLevel?.toFixed(2)} · Noul preț: ${r.newPrice?.toFixed(2)}`;
+    case "usdxdivergence":
+      return `Strategia "Smart Money Divergence vs USDX": XAUUSD/instrumentul și USDX (indicele dolarului) se mișcă normal invers (corelație negativă). Când USDX face un nou swing high/low dar instrumentul NU confirmă cu mișcarea inversă așteptată, relația normală s-a rupt — semnal de epuizare sau întoarcere posibilă.
+${r.detail}
+Nivel USDX: ${r.usdxLevel?.toFixed(2)} · Nivel instrument: ${r.instrumentLevel?.toFixed(2)}`;
     default:
       return "";
   }
@@ -320,7 +328,7 @@ function ScannerTab({ params, setParams }) {
     return () => clearInterval(clockRef.current);
   }, []);
 
-  const fetchInstrument = useCallback(async (instrumentKey) => {
+  const fetchInstrument = useCallback(async (instrumentKey, usdxCandles) => {
     const cfg = INSTRUMENTS[instrumentKey];
     setStatus((s) => ({ ...s, [instrumentKey]: "loading" }));
     try {
@@ -355,7 +363,7 @@ function ScannerTab({ params, setParams }) {
       const changePct = (change / prevClose) * 100;
       const sparkline = closes.slice(-40).map((c, i) => ({ i, v: c }));
 
-      const unified = buildUnifiedSignals(candles, htfCandles, params, candles5m);
+      const unified = buildUnifiedSignals(candles, htfCandles, params, candles5m, usdxCandles || []);
 
       setSignals((s) => ({ ...s, [instrumentKey]: unified }));
       setCandleHistory((h) => ({ ...h, [instrumentKey]: candles }));
@@ -369,7 +377,21 @@ function ScannerTab({ params, setParams }) {
   }, [params]);
 
   const refreshAll = useCallback(async () => {
-    await Promise.all([fetchInstrument("XAUUSD"), fetchInstrument("SPX")]);
+    // Fetch USDX (DXY) once and share it across both instruments for divergence comparison
+    let usdxCandles = [];
+    try {
+      const resDxy = await fetch(`/api/candles?symbol=DXY&interval=1h&outputsize=200`);
+      const tsDxy = await resDxy.json();
+      if (resDxy.ok && tsDxy.values && tsDxy.values.length) {
+        usdxCandles = tsDxy.values
+          .map((v) => ({ time: v.datetime, open: parseFloat(v.open), high: parseFloat(v.high), low: parseFloat(v.low), close: parseFloat(v.close) }))
+          .reverse();
+      }
+    } catch (e) {
+      // USDX fetch failing shouldn't block the rest of the scanner — divergence signals just won't appear
+    }
+
+    await Promise.all([fetchInstrument("XAUUSD", usdxCandles), fetchInstrument("SPX", usdxCandles)]);
     setLastUpdated(new Date());
   }, [fetchInstrument]);
 
@@ -752,6 +774,14 @@ function StrategyTab({ params }) {
         <RuleRow label="Breakout (continuare)" value="Trend clar sau sweep anterior + închidere 5m în afara VA" />
         <RuleRow label="Breakout SL" value="2 ticks peste/sub POC" />
         <RuleRow label="Breakout TP" value="2R fix" />
+      </SectionCard>
+
+      <SectionCard title="ChoCh — Change of Character" accentColor="#C084FC">
+        <p style={pStyle}>Diferit de BOS (care confirmă <b>continuarea</b> trendului), ChoCh marchează momentul exact când structura de piață se <b>schimbă</b>: o secvență bullish (Higher-High + Higher-Low) se rupe într-un Lower-Low, sau o secvență bearish (Lower-High + Lower-Low) se rupe într-un Higher-High. E primul semn obiectiv de potențială întoarcere de trend.</p>
+      </SectionCard>
+
+      <SectionCard title="Smart Money Divergence (vs USDX)" accentColor="#F59E0B">
+        <p style={pStyle}>XAUUSD (și, mai slab, alte active denominate în USD) se mișcă în mod normal invers față de USDX (indicele dolarului). Când USDX face un nou swing high dar instrumentul nu confirmă cu Lower-Low corespunzător (sau invers), corelația așteptată s-a rupt — semnal de epuizare a mișcării sau posibilă întoarcere.</p>
       </SectionCard>
 
       <SectionCard title="Lichiditate — peste toate" accentColor="#EAB308">
